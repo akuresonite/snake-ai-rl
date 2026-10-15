@@ -336,6 +336,137 @@ raw length stayed between 3 and 5.
 The honest conclusion: this agent is not short of information, so handing it more
 is not the way past the plateau. The limit is in how it learns, not what it sees.
 
+### Advanced methods, and early stopping
+
+Four switches, all off by default so existing runs and checkpoints are unchanged.
+
+| Flag | What it does |
+|------|--------------|
+| `--target-net` | A lagged copy of the network computes the bootstrap target, Polyak averaged towards the online net by `--tau`. The standard DQN fix. |
+| `--double-dqn` | The online net picks the next action, the target net scores it. Cuts the overestimation a plain `max()` causes. Needs `--target-net`. |
+| `--n-step N` | Sums the reward over N steps when filling the replay buffer, and discounts by `gamma ** N`. Propagates the sparse food reward faster. |
+| `--patience N` | Stop when the best score has not improved for N training calls. |
+
+**Early stopping is the important one.** A configuration that has flattened out
+should not spend the rest of the night running. Measured here, a 1.5 million step
+budget stopped after about 870,000 steps once the score went flat, roughly 45
+seconds instead of minutes per configuration.
+
+```
+python snake_ai_training_vec.py --target-net --double-dqn --n-step 3 --patience 400
+```
+
+The whole sweep is scripted:
+
+```
+python -m tools.sweep --steps 1500000 --seeds 0,1 --patience 400
+python -m tools.sweep --list
+```
+
+### Resuming only where there is room
+
+A resume is only worth doing where a run still had room to improve. Each
+checkpoint records whether its own run gave up early:
+
+| `stopped_early` | Meaning | Resumed by default? |
+|---|---|---|
+| `True` | the score went flat and the run stopped itself | no, that is what the flag means |
+| `False` | it used its whole step budget while still improving, or was interrupted | yes |
+
+`--resume` chooses `improvable` (default), `all` or `none`:
+
+```
+python -m tools.sweep --resume improvable
+```
+
+So a second pass over a stopped sweep spends its time only where something can
+still be gained.
+
+### Reading the TensorBoard sidebar
+
+Run folders are named so the list sorts sensibly and reads clearly:
+
+```
+<group>__<variant>__s<seed>
+```
+
+| Example | Meaning |
+|---|---|
+| `s01__baseline__s0` | plain DQN, seed 0 |
+| `s03__target-double__s1` | target network plus Double DQN, seed 1 |
+| `s05__target-n3__s2` | target network plus 3 step returns, seed 2 |
+| `s90__approx-forest__s0` | random forest as the Q function, seed 0 |
+
+Groups sort in sweep order and all seeds of one variant sit together. Finished
+runs move to `runs/archive` so the top level stays readable.
+
+```
+python tools/rename_runs.py --plan --archive-old
+python tools/rename_runs.py --apply --archive-old
+```
+
+That tool refuses to touch a run that is still being written, because moving a
+folder out from under a live training process breaks its open file handle.
+`runs/README.txt` explains the scheme in place.
+
+### Other Q functions, not just a neural net
+
+`snake_approx_compare.py` runs the same environment, replay buffer, epsilon
+schedule, target rule and rewards, and swaps only the thing that turns a state
+into Q values. Every approximator logs the same metric names, so the curves
+overlay in TensorBoard.
+
+```
+python snake_approx_compare.py --models dqn,logreg,forest,tree,svm,mlp,lightgbm \
+    --steps 400000 --games 256
+```
+
+| Model | Notes |
+|-------|-------|
+| `dqn` | the torch network, trained every step |
+| `logreg` | LogisticRegression, one per action |
+| `forest` | RandomForestRegressor |
+| `tree` | DecisionTreeRegressor |
+| `svm` | SVR with an RBF kernel and scaling |
+| `mlp` | sklearn MLPRegressor, one hidden layer of 64 |
+| `mlp2` | sklearn MLPRegressor, 128 by 128 |
+| `lightgbm` | LGBMRegressor |
+
+At 400,000 steps and one seed the forest beat the DQN, 31 against 21. One seed
+is not a conclusion, but it says the neural net is not obviously the right
+approximator for an 11 bit state.
+
+### Laya, and what can honestly be asked of it
+
+`laya_snake.py` runs `convaiinnovations/laya`, requested for this project. It is
+worth being precise about that model, because it changes the question.
+
+Laya is a **non autoregressive text decision model**: a 421M parameter
+ModernBERT-large backbone, trained with reinforcement learning to return
+calibrated probabilities for **typed questions about text**. It has no vision
+input and no action output. It cannot look at a board and it cannot emit a
+direction.
+
+So the board is rendered as text and Laya is asked, in plain language, which of
+the three legal moves is safe. That is a fair demonstration on the game, and the
+honest expectation is that it plays badly, because Snake needs planning several
+moves ahead while a text classifier scores one option list in one forward pass.
+A bad score there is a real result about the model, not a bug.
+
+```
+C:\Users\akure\miniconda3\envs\whisX\python.exe laya_snake.py --decision --episodes 5
+C:\Users\akure\miniconda3\envs\whisX\python.exe laya_snake.py --policy
+```
+
+`whisX` is the environment that works: Python 3.10, CUDA torch, transformers
+4.57, plus `laya` 0.4.8 and `tensorboard`. Measured: 638 ms per decision on the
+RTX 5050 for a 171 token board.
+
+The second experiment plays to what Laya is actually good at. Ask it to choose a
+**strategy**, then run that strategy. It chooses between flood fill, greedy and
+random, and the chosen one is executed and measured. That separates "can this
+model play Snake" from "can this model usefully decide something about Snake".
+
 ## Requirements
 
 ```

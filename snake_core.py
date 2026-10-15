@@ -179,13 +179,47 @@ class Linear_QNet(nn.Module):
 
 
 class QTrainer:
-    def __init__(self, model, lr, gamma, weight_decay=WEIGHT_DECAY):
+    """Trains the Q network.
+
+    Advanced method switches, all off by default so existing runs and
+    checkpoints are unchanged:
+
+      target           a lagged copy of the network computes the bootstrap
+                       target. THE standard DQN fix. Without it the network
+                       chases its own output every step.
+      double_dqn       the online network picks the next action, the target
+                       network scores it. Cuts the overestimation that plain
+                       max() produces. Needs target=True to mean anything.
+      n_step           the rewards in the replay buffer were already summed
+                       over n steps by the caller. This only changes the
+                       discount factor from gamma to gamma ** n.
+    """
+
+    def __init__(self, model, lr, gamma, weight_decay=WEIGHT_DECAY,
+                 target=False, double_dqn=False, n_step=1, tau=0.01):
         self.lr = lr
         self.gamma = gamma
         self.model = model
         self.optimizer = optim.AdamW(model.parameters(), lr=self.lr, weight_decay=weight_decay)
         # Huber loss is far less twitchy than MSE when a TD target overshoots.
         self.criterion = nn.SmoothL1Loss()
+
+        self.use_target = bool(target)
+        self.double_dqn = bool(double_dqn)
+        self.n_step = max(1, int(n_step))
+        self.tau = float(tau)
+        self.target_model = None
+        self.soft_updates = 0
+
+        if self.use_target:
+            import copy
+            self.target_model = copy.deepcopy(model)
+            self.target_model.eval()
+            for p in self.target_model.parameters():
+                p.requires_grad_(False)
+            # Gradient clipping must not see the target copy twice, and its
+            # parameters never need gradients.
+            self._param_list = [p for p in model.parameters()]
 
         # Diagnostics, read by the logging layer. Left as None so that a caller
         # who does not log pays nothing for them. One float per step is cheap.
@@ -194,6 +228,17 @@ class QTrainer:
         self.last_q_mean = None
         self.last_q_max = None
         self.last_target_mean = None
+
+    def soft_update_target(self):
+        """Polyak average the target towards the online network."""
+        if self.target_model is None:
+            return
+        with torch.no_grad():
+            for tp, op in zip(self.target_model.parameters(), self.model.parameters()):
+                tp.mul_(1.0 - self.tau).add_(op, alpha=self.tau)
+            for tb, ob in zip(self.target_model.buffers(), self.model.buffers()):
+                tb.copy_(ob)
+        self.soft_updates += 1
 
     def train_step(self, state, action, reward, next_state, done):
         device = next(self.model.parameters()).device
@@ -225,14 +270,22 @@ class QTrainer:
         # 1: Predicted Q values with current state.
         pred = self.model(state)
 
-        # 2: Q_new = r + gamma * max(next_predicted Q value), only if not done.
-        # The bootstrap target is computed in eval mode under no_grad so dropout
-        # noise stays out of the target and no graph is built for it.
+        # 2: The bootstrap target. Computed in eval mode under no_grad so dropout
+        # noise stays out of it and no graph is built.
+        bootstrap_net = self.target_model if self.target_model is not None else self.model
         with torch.no_grad():
             was_training = self.model.training
             self.model.eval()
-            next_q = self.model(next_state)
-            target_q = reward + self.gamma * next_q.max(dim=1).values * (1.0 - done)
+            bootstrap_net.eval()
+            next_q = bootstrap_net(next_state)
+            if self.double_dqn and self.target_model is not None:
+                # Online net chooses the action, target net scores it.
+                best_action = self.model(next_state).argmax(dim=1, keepdim=True)
+                next_max = next_q.gather(1, best_action).squeeze(1)
+            else:
+                next_max = next_q.max(dim=1).values
+            discount = self.gamma ** self.n_step
+            target_q = reward + discount * next_max * (1.0 - done)
             if was_training:
                 self.model.train()
 
@@ -247,8 +300,12 @@ class QTrainer:
         loss.backward()
         # Gradient clipping keeps the occasional huge TD error from wrecking the
         # weights.
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        params = self._param_list if self.use_target else self.model.parameters()
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
         self.optimizer.step()
+
+        if self.target_model is not None:
+            self.soft_update_target()
 
         # Record diagnostics without any extra forward or backward pass. A
         # collapsed grad norm here is the signal that learning has stalled, and
@@ -259,12 +316,22 @@ class QTrainer:
         self.last_q_max = float(pred.max().detach())
         self.last_target_mean = float(target_q.mean().detach())
 
+    def describe(self):
+        bits = [f"lr={self.lr}", f"gamma={self.gamma}"]
+        if self.use_target:
+            bits.append(f"target_net(tau={self.tau})")
+        if self.double_dqn and self.use_target:
+            bits.append("double_dqn")
+        if self.n_step > 1:
+            bits.append(f"n_step={self.n_step}")
+        return "QTrainer(" + ", ".join(bits) + ")"
+
 
 # ==========================================
 # CHECKPOINT HELPERS
 # ==========================================
 
-def architecture_fingerprint(input_size=11, output_size=3):
+def architecture_fingerprint(input_size=11, output_size=3, use_norm=True):
     """Shape of the network, stored in the checkpoint and checked on load."""
     return {
         "input_size": input_size,
@@ -272,6 +339,9 @@ def architecture_fingerprint(input_size=11, output_size=3):
         "hidden_layers": HIDDEN_LAYERS,
         "output_size": output_size,
         "dropout_p": DROPOUT_P,
+        # Recorded because a checkpoint from a norm net cannot load into a
+        # no-norm net, and the mismatch should be reported rather than crash.
+        "use_norm": bool(use_norm),
     }
 
 

@@ -74,6 +74,50 @@ VEC_BEST_CHECKPOINT = "./model/vec_best.pth"
 
 
 # ==========================================
+# RUN NAMING
+# ==========================================
+# TensorBoard lists runs alphabetically by folder name, so the folder name is
+# what the sidebar looks like. One scheme, used by the trainer, the sweep runner
+# and tools/rename_runs.py, so all three agree:
+#
+#     <group>__<variant>__s<seed>
+#
+#   group    what is compared, s01, s02 and so on, so groups sort in sweep order
+#   variant  what makes the run different, letters digits dash underscore only.
+#            TensorBoard splits a name on slashes, so no slashes, no spaces.
+#   seed     the random seed, so repeats sit next to each other
+#
+# Example: s03__target-double__s0
+
+
+def snake_variant_desc(obs_mode="basic", use_norm=True, target_net=False,
+                       double_dqn=False, n_step=1):
+    """Short description of what makes a run different from the baseline."""
+    bits = []
+    if obs_mode != "basic":
+        bits.append(obs_mode)
+    if not use_norm:
+        bits.append("no-norm")
+    if target_net:
+        bits.append("target")
+        if double_dqn:
+            bits.append("double")
+    if n_step and int(n_step) > 1:
+        bits.append(f"n{int(n_step)}")
+    return "-".join(bits) if bits else "baseline"
+
+
+def snake_run_name(group, obs_mode="basic", use_norm=True, target_net=False,
+                   double_dqn=False, n_step=1, seed=None):
+    """Build the folder name for one run."""
+    variant = snake_variant_desc(obs_mode, use_norm, target_net, double_dqn, n_step)
+    name = f"{group}__{variant}"
+    if seed is not None:
+        name += f"__s{seed}"
+    return name
+
+
+# ==========================================
 # BOARD GEOMETRY, no pygame
 # ==========================================
 
@@ -402,10 +446,11 @@ class VecSnake:
 class VecAgent:
     """One network, one replay buffer, N games feeding it."""
 
-    def __init__(self, device):
+    def __init__(self, device, use_norm=True):
         self.device = device
         self.n_games = 0
         self.memory = deque(maxlen=MAX_MEMORY)
+        self.use_norm = use_norm
         # Set from the environment by train(), so the network width and the
         # observation width can never disagree.
         self.obs_width = VecSnake.WIDTHS["basic"]
@@ -414,6 +459,7 @@ class VecAgent:
             hidden_size=HIDDEN_SIZE,
             output_size=3,
             hidden_layers=HIDDEN_LAYERS,
+            use_norm=use_norm,
         ).to(device)
         self.trainer = QTrainer(self.model, lr=LR, gamma=GAMMA)
         self.record = 0
@@ -423,7 +469,8 @@ class VecAgent:
     def architecture(self):
         # Shared with the single game script, so a checkpoint written by either
         # one is recognised by the other.
-        return architecture_fingerprint(input_size=self.obs_width)
+        return architecture_fingerprint(input_size=self.obs_width,
+                                        use_norm=getattr(self, "use_norm", True))
 
     # ---- exploration ------------------------------------------------------
     def epsilon_for(self, episodes):
@@ -470,6 +517,12 @@ class VecAgent:
         states, actions, rewards, next_states, dones = zip(*batch)
         self.trainer.train_step(states, actions, rewards, next_states, dones)
         return None
+
+    def remember_one(self, obs, action, reward, next_obs, done):
+        """Store a single transition, used by the n step path."""
+        one_hot = np.zeros(3, dtype=np.int8)
+        one_hot[int(action)] = 1
+        self.memory.append((obs, one_hot, float(reward), next_obs, bool(done)))
 
     # ---- checkpoint -------------------------------------------------------
     @staticmethod
@@ -557,7 +610,9 @@ def resolve_device(name):
 def train(n_games, total_steps, train_every, device_name, checkpoint,
           best_checkpoint=VEC_BEST_CHECKPOINT, save_every=60.0, quiet=False,
           log_backend="both", run_name=None, log_dir="./runs", report_every=5.0,
-          log_every=1.0, obs_mode="basic"):
+          log_every=1.0, obs_mode="basic", use_norm=True,
+          target_net=False, double_dqn=False, n_step=1, tau=0.01,
+          patience=0, min_train_calls=200, log_group=None):
     """Train the vectorized agent.
 
     Two checkpoint files are kept on purpose:
@@ -572,14 +627,38 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     Curves go to TensorBoard and MLflow. Set log_backend to "none" to skip both,
     or "tensorboard" / "mlflow" for just one. quiet only silences the terminal,
     it does not stop the logging.
+
+    Advanced methods, all off by default:
+
+      target_net  a lagged copy computes the bootstrap target, updated by a
+                  Polyak average. The standard DQN fix.
+      double_dqn  the online net picks the next action, the target net scores
+                  it. Needs target_net to do anything.
+      n_step      sum rewards over n steps when filling the replay buffer.
+                  Propagates the sparse food reward faster.
+
+    patience    stop when the best score has not improved for this many training
+                calls. 0 disables it and runs the full step budget. This is what
+                keeps a sweep from spending hours on a configuration that has
+                already plateaued.
     """
     device = resolve_device(device_name)
     print(f"=> {n_games} parallel games on {device}")
     if device.type == "cuda":
         print(f"=> GPU: {torch.cuda.get_device_name(0)}")
 
+    # Readable TensorBoard folder name when the caller did not pick one, so the
+    # sidebar says what the run is instead of run-20261016-011435.
+    if not run_name:
+        run_name = snake_run_name(
+            group=log_group or "s99",
+            obs_mode=obs_mode, use_norm=use_norm, target_net=target_net,
+            double_dqn=double_dqn, n_step=n_step,
+        )
+        print(f"=> run name: {run_name}")
+
     env = VecSnake(n_games, obs_mode=obs_mode)
-    agent = VecAgent(device)
+    agent = VecAgent(device, use_norm=use_norm)
     # The network width comes from the environment. If these two ever disagree,
     # the replay samples and the model cannot be multiplied and training raises.
     agent.obs_width = env.obs_width
@@ -588,9 +667,17 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
         hidden_size=HIDDEN_SIZE,
         output_size=3,
         hidden_layers=HIDDEN_LAYERS,
+        use_norm=use_norm,
     ).to(device)
-    agent.trainer = QTrainer(agent.model, lr=LR, gamma=GAMMA)
-    print(f"=> state vector: {obs_mode}, {env.obs_width} features")
+    agent.trainer = QTrainer(agent.model, lr=LR, gamma=GAMMA,
+                             target=target_net, double_dqn=double_dqn,
+                             n_step=n_step, tau=tau)
+    print(f"=> state vector: {obs_mode}, {env.obs_width} features, "
+          f"LayerNorm {'on' if use_norm else 'OFF'}")
+    print(f"=> trainer: {agent.trainer.describe()}")
+    if patience:
+        print(f"=> early stop: no improvement for {patience} training calls "
+              f"(after at least {min_train_calls})")
     # Episodes arrive n_games times faster, so the exploration curve has to be
     # stretched out or epsilon would hit the floor in a few hundred steps.
     #
@@ -645,6 +732,7 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                     "train_every": train_every,
                     "obs_mode": obs_mode,
                     "obs_width": env.obs_width,
+                    "use_norm": use_norm,
                     "hidden_size": HIDDEN_SIZE,
                     "hidden_layers": HIDDEN_LAYERS,
                     "lr": LR,
@@ -679,6 +767,19 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     train_calls = 0
     diag_acc = {}
     interrupted = False
+    stopped_early = False
+
+    # n-step bookkeeping. Reward for a game is summed over n steps and stored
+    # against the observation n steps ago, which is where that return starts.
+    pending_r = np.zeros(n_games, dtype=np.float32)
+    track_obs = obs.copy()
+    track_act = np.zeros(n_games, dtype=np.int64)
+    steps_since_store = np.zeros(n_games, dtype=np.int32)
+
+    # Early stopping state. A new record resets the counter, so a configuration
+    # that is still improving keeps running and one that has stalled stops.
+    calls_since_best = 0
+    best_seen = agent.record
 
     try:
         while steps_done < total_steps:
@@ -687,10 +788,27 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
 
             next_obs, rewards, done, scores = env.step(actions)
 
-            # next_obs is the post reset observation for finished games. That is
-            # fine here because done=True makes the bootstrap term fall away in
-            # the trainer, so the next state is never actually read.
-            agent.remember_many(obs, actions, rewards, next_obs, done)
+            if n_step > 1:
+                # Accumulate the reward, then store a sample once every n steps,
+                # or at the end of a game, whichever comes first. The sample is
+                # tied to the observation that opened the window, which is where
+                # this n step return starts.
+                pending_r += rewards
+                steps_since_store += 1
+                for i in range(n_games):
+                    if steps_since_store[i] >= n_step or done[i]:
+                        agent.remember_one(track_obs[i], track_act[i],
+                                           float(pending_r[i]), next_obs[i],
+                                           bool(done[i]))
+                        pending_r[i] = 0.0
+                        steps_since_store[i] = 0
+                        track_obs[i] = next_obs[i]
+                        track_act[i] = actions[i]
+            else:
+                # next_obs is the post reset observation for finished games. That
+                # is fine here because done=True makes the bootstrap term fall
+                # away in the trainer, so the next state is never read.
+                agent.remember_many(obs, actions, rewards, next_obs, done)
 
             # Score keeping for the games that just ended.
             for i in np.flatnonzero(done):
@@ -721,6 +839,32 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                 agent.train_on_replay()
                 train_calls += 1
                 next_train += train_every
+
+                # Early stopping. A new record resets the counter, so a run that
+                # is still improving continues and one that has flattened out
+                # stops instead of burning hours for nothing.
+                if patience and train_calls >= min_train_calls:
+                    if agent.record > best_seen:
+                        best_seen = agent.record
+                        calls_since_best = 0
+                    else:
+                        calls_since_best += 1
+                        if calls_since_best >= patience:
+                            print(f"=> EARLY STOP: best score stuck at {agent.record} "
+                                  f"for {calls_since_best} training calls "
+                                  f"({steps_done:,} steps this run)")
+                            log.add("early_stop/triggered", 1, total_seen)
+                            stopped_early = True
+                            # Make sure a best file exists before leaving. If no
+                            # record was ever set there is nothing else to save,
+                            # and a run with no checkpoint cannot be resumed.
+                            if not os.path.exists(best_checkpoint):
+                                agent.save(best_checkpoint,
+                                           extra={"steps": total_seen,
+                                                  "stopped_early": True})
+                                print(f"=> saved {best_checkpoint} at exit")
+                            break
+                log.add("early_stop/calls_since_best", calls_since_best, total_seen)
                 # Diagnostics are ACCUMULATED here and averaged into one point
                 # per report below. Writing them every step produced 49,000 rows
                 # per metric in a 150,000 step run, which makes the MLflow store
@@ -743,7 +887,8 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
             # work. Records stop falling late in training, and without this the
             # only save points would be the rare new record.
             if now - last_save >= save_every:
-                agent.save(checkpoint, extra={"steps": total_seen})
+                agent.save(checkpoint, extra={"steps": total_seen,
+                                            "stopped_early": stopped_early})
                 last_save = now
                 print(f"  [saved] {steps_done:,} into this run "
                       f"({total_seen:,} total), best {agent.record}")
@@ -804,13 +949,15 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     except KeyboardInterrupt:
         interrupted = True
         print("\n=> Stopped by user. Saving before exit...")
-        agent.save(checkpoint, extra={"steps": total_seen})
+        agent.save(checkpoint, extra={"steps": total_seen,
+                                            "stopped_early": stopped_early})
         print(f"=> Saved {checkpoint}")
 
     elapsed = time.perf_counter() - t0
     # Always leave a current latest file behind, whether we finished the run or
     # the user stopped it.
-    agent.save(checkpoint, extra={"steps": total_seen})
+    agent.save(checkpoint, extra={"steps": total_seen,
+                                            "stopped_early": stopped_early})
 
     recent_r = env.episode_returns
     recent_s = env.episode_scores
@@ -877,12 +1024,32 @@ def main():
                    choices=sorted(VecSnake.WIDTHS),
                    help="what the agent can see: basic 11 features, or rich 21 "
                         "with wall distance, tail distance and snake length")
+    p.add_argument("--no-norm", dest="use_norm", action="store_false",
+                   help="drop LayerNorm from the hidden layers. Tested: does not help")
+    p.set_defaults(use_norm=True)
+    p.add_argument("--target-net", action="store_true",
+                   help="lagged target network for the bootstrap, Polyak averaged")
+    p.add_argument("--double-dqn", action="store_true",
+                   help="online net picks the action, target net scores it")
+    p.add_argument("--n-step", type=int, default=1,
+                   help="sum rewards over this many steps when filling replay")
+    p.add_argument("--tau", type=float, default=0.01,
+                   help="Polyak rate for the target network (default 0.01)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="stop after this many training calls with no new record. "
+                        "0 disables early stopping")
+    p.add_argument("--min-train-calls", type=int, default=200,
+                   help="do not early stop before this many training calls")
+    p.add_argument("--log-group", default=None,
+                   help="prefix for the auto run name, e.g. s03")
     p.add_argument("--quiet", action="store_true",
                    help="silence the terminal, logging still happens")
     a = p.parse_args()
     train(a.games, a.steps, a.train_every, a.device, a.checkpoint,
           a.best_checkpoint, a.save_every, a.quiet, a.log_backend,
-          a.run_name, a.log_dir, a.report_every, a.log_every, a.obs_mode)
+          a.run_name, a.log_dir, a.report_every, a.log_every, a.obs_mode,
+          a.use_norm, a.target_net, a.double_dqn, a.n_step, a.tau,
+          a.patience, a.min_train_calls, a.log_group)
 
 
 if __name__ == "__main__":

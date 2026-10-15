@@ -267,6 +267,45 @@ def run(model_name, n_games, total_steps, obs_mode, log_backend, run_name):
                                   num_leaves=31, min_child_samples=20,
                                   verbose=-1, n_jobs=-1),
             refit_every=2000, sample_size=40000, label="LGBMRegressor")
+    elif model_name == "tree":
+        from sklearn.tree import DecisionTreeRegressor
+        qf = SklearnFunction(
+            lambda: DecisionTreeRegressor(max_depth=12, min_samples_leaf=10),
+            refit_every=5000, sample_size=10000, label="DecisionTreeRegressor")
+    elif model_name == "svm":
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.svm import SVR
+        # SVR is O(n^2) in the sample count, so it gets a small sample and a
+        # long gap between refits. Scaling first matters, the raw state mixes
+        # 0/1 flags with distances.
+        qf = SklearnFunction(
+            lambda: make_pipeline(StandardScaler(),
+                                  SVR(kernel="rbf", C=1.0, gamma="scale",
+                                      epsilon=0.1)),
+            refit_every=10000, sample_size=3000, label="SVR(rbf)")
+    elif model_name == "mlp":
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.neural_network import MLPRegressor
+        # Small and few iterations on purpose: this refits often, so a big MLP
+        # would spend all its time in fit and none in the environment.
+        qf = SklearnFunction(
+            lambda: make_pipeline(StandardScaler(),
+                                  MLPRegressor(hidden_layer_sizes=(64,),
+                                               max_iter=40, learning_rate_init=1e-3,
+                                               early_stopping=False)),
+            refit_every=2000, sample_size=8000, label="MLPRegressor(64)")
+    elif model_name == "mlp2":
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.neural_network import MLPRegressor
+        qf = SklearnFunction(
+            lambda: make_pipeline(StandardScaler(),
+                                  MLPRegressor(hidden_layer_sizes=(128, 128),
+                                               max_iter=40, learning_rate_init=1e-3,
+                                               early_stopping=False)),
+            refit_every=2000, sample_size=8000, label="MLPRegressor(128,128)")
     else:
         raise ValueError(f"unknown model {model_name}")
 
