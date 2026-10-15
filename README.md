@@ -203,6 +203,69 @@ one that fails to load.
 Resuming checks the latest file first and falls back to the best file, so either
 one can start a run.
 
+### Watching the training curves
+
+The vectorized trainer logs to TensorBoard and MLflow. No install is needed for
+MLflow, because the run format on disk is plain JSON and TSV and the trainer
+writes it directly. TensorBoard does need one package.
+
+```
+python snake_ai_training_vec.py --games 256 --steps 2000000 --run-name first-real-run
+```
+
+Then, in another terminal:
+
+```
+pip install tensorboard
+tensorboard --logdir runs
+```
+
+For MLflow, if you have the package:
+
+```
+mlflow ui --backend-store-uri runs/mlruns
+```
+
+If you do not have the mlflow package, the files are still written and the UI
+will read them the moment you install it. Nothing is lost.
+
+Useful flags:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--log` | `both` | `both`, `tensorboard`, `mlflow` or `none` |
+| `--run-name` | `run-<timestamp>` | name shown in both UIs |
+| `--log-dir` | `./runs` | where the output goes |
+| `--log-every` | `1` | seconds between points on the curves |
+| `--report-every` | `5` | seconds between console reports |
+
+The two intervals are separate on purpose. The curves want frequent points, the
+terminal only wants to be readable.
+
+`--quiet` silences the terminal only. The curves still get written.
+
+### What gets logged
+
+| Curve | Meaning |
+|-------|---------|
+| `episode/score` | one point per finished game, the noisy but honest one |
+| `episode/best_score` | record score when it improves |
+| `episode/score_mean_200` | rolling mean over the last 200 games |
+| `episode/score_max_200` | best of the last 200 games |
+| `episode/return_mean_200` | rolling mean of the shaped reward |
+| `episode/length_mean_200` | average frames survived |
+| `explore/epsilon` | exploration rate, should fall to the floor |
+| `train/loss_mean` | TD loss, averaged over the report window |
+| `train/grad_norm_mean` | gradient norm, see the plateau note below |
+| `train/q_mean_mean`, `train/q_max_mean`, `train/target_mean_mean` | value estimates |
+| `throughput/steps_per_s` | speed, so you can see a regression when you change something |
+| `replay/size`, `replay/train_calls` | buffer filling up |
+| `progress/steps`, `progress/episodes`, `progress_wall_clock_s` | axes and timing |
+
+Diagnostics are averaged into one point per log window. Writing them every
+training step produced about 49,000 rows per metric in a 150,000 step run, which
+made the MLflow store slow to open for no extra information.
+
 ## Requirements
 
 ```
@@ -263,11 +326,13 @@ regardless. Model weights are gitignored, so you will not find them in this repo
 
 ```
 snake_core.py                shared pygame free core, imported by both below
+snake_logging.py             TensorBoard and MLflow metrics
 snake_ai_training.py         original single window version
 snake_ai_training2.py        dashboard UI, baseline shallow network
 snake_ai_training_Deep.py    reference implementation, one game at a time
 snake_ai_training_vec.py     many games at once, one network, no window
 model/                       checkpoint directory, contents gitignored
+runs/                        TensorBoard and MLflow output, gitignored
 requirements.txt             runtime dependencies
 .gitattributes               pins LF line endings across platforms
 LICENSE                      MIT
