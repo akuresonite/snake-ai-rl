@@ -1,0 +1,25 @@
+# Normalise line endings so the working tree matches on every platform.
+#
+# Git for Windows sets core.autocrlf=true in its system config, which rewrites
+# LF to CRLF on checkout. That makes the working tree disagree with the index
+# and creates fake diffs for anyone on Linux or macOS. Pinning eol=lf here
+# overrides autocrlf and keeps every text file LF everywhere.
+
+* text=auto eol=lf
+
+# Binary formats. Never touch these, a line ending conversion corrupts them.
+*.pth binary
+*.pt binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+
+# Windows-only files, CRLF is correct for these.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

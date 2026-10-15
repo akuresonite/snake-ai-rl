@@ -1,0 +1,11 @@
+# Core runtime. Training the reference script needs all four, plus kaleido
+# for the live chart panel.
+torch>=2.2
+numpy>=1.26
+pygame>=2.5
+plotly>=5.20
+kaleido>=0.2.1
+
+# Optional. Install only if you have an Intel GPU and want the XPU backend
+# that get_device() looks for. Safe to skip on CPU and CUDA machines.
+# intel-extension-for-pytorch

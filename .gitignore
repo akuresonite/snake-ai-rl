@@ -26,6 +26,12 @@ logs/
 *.pdf
 !docs/**/*.png
 
+# Local agent instructions. Kept on disk, never published.
+# Listed in both cases because the GitHub side is case sensitive.
+AGENTS.md
+Agents.md
+agents.md
+
 # Editors and OS junk
 .vscode/
 .idea/
