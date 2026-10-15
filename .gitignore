@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# PyTorch / training artifacts
+*.pt
+*.pth
+checkpoints/
+runs/
+logs/
+*.log
+
+# Plotly / kaleido cache
+.kaleido/
+
+# Matplotlib
+*.png
+*.svg
+*.pdf
+!docs/**/*.png
+
+# Editors and OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Google Drive sync leftovers
+*.gdoc
+*.gsheet
+*.gslides
+*.tmp
+~$*
