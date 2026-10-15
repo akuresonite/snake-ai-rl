@@ -68,6 +68,7 @@ from snake_core import (  # noqa: E402
 THREADS = set_threads(SNAKE_THREADS) if SNAKE_THREADS else None
 
 VEC_CHECKPOINT = "./model/vec_checkpoint.pth"
+VEC_BEST_CHECKPOINT = "./model/vec_best.pth"
 
 
 # ==========================================
@@ -402,7 +403,16 @@ class VecAgent:
             print(f"=> Could not load checkpoint: {type(e).__name__}: {e}. Starting fresh.")
 
     def save(self, path, extra=None):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        """Write the checkpoint atomically.
+
+        A plain torch.save can leave a half written file if the process dies
+        mid write, which then fails to load. Writing to a temporary file first
+        and renaming means the path is always either the old file or the new
+        one, never something in between.
+        """
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         payload = {
             "n_games": self.n_games,
             "record": self.record,
@@ -413,7 +423,22 @@ class VecAgent:
         }
         if extra:
             payload.update(extra)
-        torch.save(payload, path)
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+
+    def load_any(self, *paths):
+        """Try each path in order and load the first one that exists.
+
+        Called with the latest file first and the best file second, so a fresh
+        run picks up whichever one is actually there.
+        """
+        for p in paths:
+            if p and os.path.exists(p):
+                self.load(p)
+                return True
+        print("=> No checkpoint found. Starting fresh.")
+        return False
 
 
 # ==========================================
@@ -431,7 +456,19 @@ def resolve_device(name):
     return torch.device(name)
 
 
-def train(n_games, total_steps, train_every, device_name, checkpoint, quiet=False):
+def train(n_games, total_steps, train_every, device_name, checkpoint,
+          best_checkpoint=VEC_BEST_CHECKPOINT, save_every=60.0, quiet=False):
+    """Train the vectorized agent.
+
+    Two checkpoint files are kept on purpose:
+
+      checkpoint       the latest state, rewritten every save_every seconds
+      best_checkpoint  the model that held the record score
+
+    They are separate because the latest file is what you resume from, and the
+    best file is what you show off. If they were one file, a lucky random game
+    early in training could overwrite a genuinely good model.
+    """
     device = resolve_device(device_name)
     print(f"=> {n_games} parallel games on {device}")
     if device.type == "cuda":
@@ -449,71 +486,101 @@ def train(n_games, total_steps, train_every, device_name, checkpoint, quiet=Fals
     agent.decay_episodes = EPSILON_DECAY_GAMES * (n_games ** 0.5)
     print(f"=> epsilon decays over {agent.decay_episodes:,.0f} episodes "
           f"({EPSILON_DECAY_GAMES} x sqrt({n_games}))")
-    agent.load(checkpoint)
+
+    # Resume from the latest state if there is one, otherwise from the best
+    # model file. They are different files now, see the comments in the loop.
+    agent.load_any(checkpoint, best_checkpoint)
 
     obs = env.observe()
     next_train = train_every
     t0 = time.perf_counter()
     last_report = t0
+    last_save = t0
     report_step = 0
     steps_done = 0
     train_calls = 0
+    interrupted = False
 
-    while steps_done < total_steps:
-        eps = agent.epsilon_for(env.episodes)
-        actions = agent.act(obs, eps)
+    try:
+        while steps_done < total_steps:
+            eps = agent.epsilon_for(env.episodes)
+            actions = agent.act(obs, eps)
 
-        next_obs, rewards, done, scores = env.step(actions)
+            next_obs, rewards, done, scores = env.step(actions)
 
-        # next_obs is the post reset observation for finished games. That is
-        # fine here because done=True makes the bootstrap term fall away in the
-        # trainer, so the next state is never actually read for those samples.
-        agent.remember_many(obs, actions, rewards, next_obs, done)
+            # next_obs is the post reset observation for finished games. That is
+            # fine here because done=True makes the bootstrap term fall away in
+            # the trainer, so the next state is never actually read.
+            agent.remember_many(obs, actions, rewards, next_obs, done)
 
-        # Score keeping for the games that just ended.
-        for i in np.flatnonzero(done):
-            agent.n_games += 1
-            s = int(scores[i])
-            agent.total_score += s
-            if s > agent.record:
-                agent.record = s
+            # Score keeping for the games that just ended.
+            for i in np.flatnonzero(done):
+                agent.n_games += 1
+                s = int(scores[i])
+                agent.total_score += s
+                if s > agent.record:
+                    # A new record goes to its own file. The latest file is
+                    # written on a timer below, so a lucky random game that sets
+                    # a high score early cannot cost you the good model.
+                    agent.record = s
+                    agent.save(best_checkpoint, extra={"steps": steps_done})
+
+            obs = next_obs
+            steps_done += n_games
+
+            if steps_done >= next_train:
+                agent.train_on_replay()
+                train_calls += 1
+                next_train += train_every
+
+            now = time.perf_counter()
+
+            # Time based save, so a plateau in the score cannot cost an hour of
+            # work. Records stop falling late in training, and without this the
+            # only save points would be the rare new record.
+            if now - last_save >= save_every:
                 agent.save(checkpoint, extra={"steps": steps_done})
+                last_save = now
+                if not quiet:
+                    print(f"  [saved] {checkpoint} at {steps_done:,} steps, "
+                          f"best {agent.record}")
 
-        obs = next_obs
-        steps_done += n_games
-
-        if steps_done >= next_train:
-            agent.train_on_replay()
-            train_calls += 1
-            next_train += train_every
-
-        now = time.perf_counter()
-        if not quiet and now - last_report >= 10.0:
-            sps = (steps_done - report_step) / (now - last_report)
-            recent = env.episode_returns
-            avg_ret = float(np.mean(recent)) if recent else 0.0
-            print(
-                f"steps {steps_done:>10,} | games {agent.n_games:>7,} | "
-                f"eps {eps:.3f} | best {agent.record:>3} | "
-                f"avg return {avg_ret:6.2f} | {sps:8,.0f} steps/s | "
-                f"replay {len(agent.memory):>6,}"
-            )
-            last_report = now
-            report_step = steps_done
+            if not quiet and now - last_report >= 10.0:
+                sps = (steps_done - report_step) / (now - last_report)
+                recent = env.episode_returns
+                avg_ret = float(np.mean(recent)) if recent else 0.0
+                print(
+                    f"steps {steps_done:>10,} | games {agent.n_games:>7,} | "
+                    f"eps {eps:.3f} | best {agent.record:>3} | "
+                    f"avg return {avg_ret:6.2f} | {sps:8,.0f} steps/s | "
+                    f"replay {len(agent.memory):>6,}"
+                )
+                last_report = now
+                report_step = steps_done
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n=> Stopped by user. Saving before exit...")
+        agent.save(checkpoint, extra={"steps": steps_done})
+        print(f"=> Saved {checkpoint}")
 
     elapsed = time.perf_counter() - t0
+    # Always leave a current latest file behind, whether we finished the run or
+    # the user stopped it.
     agent.save(checkpoint, extra={"steps": steps_done})
+
     recent = env.episode_returns
     print("-" * 72)
-    print(f"finished {steps_done:,} steps in {elapsed:.1f}s")
-    print(f"  throughput     : {steps_done/elapsed:,.0f} steps/s")
+    print(f"{'stopped' if interrupted else 'finished'} at {steps_done:,} steps "
+          f"in {elapsed:.1f}s")
+    print(f"  throughput     : {steps_done/max(elapsed, 1e-9):,.0f} steps/s")
     print(f"  games finished : {agent.n_games}")
     print(f"  best score     : {agent.record}")
     print(f"  avg return     : {float(np.mean(recent)) if recent else 0.0:.2f} (last {len(recent)} games)")
     print(f"  replay size    : {len(agent.memory):,}")
     print(f"  train calls    : {train_calls:,}")
-    print(f"  checkpoint     : {checkpoint}")
-    return steps_done / elapsed
+    print(f"  latest file    : {checkpoint}")
+    print(f"  best file      : {best_checkpoint}")
+    return steps_done / max(elapsed, 1e-9)
 
 
 def main():
@@ -523,10 +590,16 @@ def main():
     p.add_argument("--train-every", type=int, default=8,
                    help="run one replay batch every N steps (default 8)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "xpu"])
-    p.add_argument("--checkpoint", default=VEC_CHECKPOINT)
+    p.add_argument("--checkpoint", default=VEC_CHECKPOINT,
+                   help="latest state, rewritten on a timer and on Ctrl+C")
+    p.add_argument("--best-checkpoint", default=VEC_BEST_CHECKPOINT,
+                   help="model that held the record score, kept separately")
+    p.add_argument("--save-every", type=float, default=60.0,
+                   help="seconds between latest state saves (default 60)")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args()
-    train(a.games, a.steps, a.train_every, a.device, a.checkpoint, a.quiet)
+    train(a.games, a.steps, a.train_every, a.device, a.checkpoint,
+          a.best_checkpoint, a.save_every, a.quiet)
 
 
 if __name__ == "__main__":
