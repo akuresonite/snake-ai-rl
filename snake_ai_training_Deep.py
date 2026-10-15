@@ -49,6 +49,28 @@ def get_device():
 DEVICE = get_device()
 
 # ==========================================
+# THREAD CONFIGURATION
+# ==========================================
+# Measured on an RTX 5050 laptop with the 11 -> 128 x2 -> 3 network:
+#
+#   1 thread  : 1595 us per step
+#   2 threads : 2303 us
+#   4 threads : 2603 us
+#   8 threads : 2874 us
+#   16 threads: 2610 us   (the default)
+#
+# More threads made this slower. The model is tiny, so the thread pool setup
+# costs more than the arithmetic it saves. One thread is about 1.6x faster than
+# the default. Override with the SNAKE_THREADS environment variable if you ever
+# train something bigger.
+THREADS = int(os.environ.get("SNAKE_THREADS", "1"))
+
+try:
+    torch.set_num_threads(THREADS)
+except Exception:
+    pass
+
+# ==========================================
 # HYPERPARAMETERS
 # ==========================================
 # Kept in one place so the values in AGENTS.md and the README stay honest.
