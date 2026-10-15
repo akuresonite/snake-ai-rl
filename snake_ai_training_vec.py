@@ -106,10 +106,26 @@ class VecSnake:
 
     State layout is one numpy array per fact, so everything can be gathered and
     written back in a single shot instead of looping over games in Python.
+
+    obs_mode picks what the agent can see. The width is owned HERE, on purpose:
+    an earlier experiment built a 19 input network but kept 11 wide samples in
+    replay, so training raised and the result was noise. Keeping the width next
+    to the code that fills it makes that mistake impossible.
+
+      "basic"  11 features. The original. One cell of lookahead.
+      "rich"   21 features. Adds wall distance, distance to the tail, and the
+               length of the snake, so the agent can tell a short snake in open
+               space from a long one that is running out of room.
     """
 
-    def __init__(self, n_games, w=800, h=600, auto_reset=True):
+    WIDTHS = {"basic": 11, "rich": 21}
+
+    def __init__(self, n_games, w=800, h=600, auto_reset=True, obs_mode="basic"):
+        if obs_mode not in self.WIDTHS:
+            raise ValueError(f"obs_mode must be one of {sorted(self.WIDTHS)}")
         self.n = n_games
+        self.obs_mode = obs_mode
+        self.obs_width = self.WIDTHS[obs_mode]
         self.board = Board(w, h)
         self.auto_reset = auto_reset
         self.steps = 0
@@ -170,28 +186,25 @@ class VecSnake:
 
     # ---- observation ------------------------------------------------------
     def observe(self):
-        """Stack the 11 value state for every game. Returns (n, 11) int8."""
-        n = self.n
-        out = np.zeros((n, 11), dtype=np.int8)
+        """Stack the state vector for every game. Returns (n, obs_width) int8.
 
-        # Danger straight, right, left for each direction. Same table as the
-        # single game version, applied to all games at once.
+        Every feature is scaled to a comparable range. The wall distances are
+        divided down to 0..4, because a raw distance of up to 39 next to ten
+        features that are only 0 or 1 hands the network one input with about
+        forty times the range of the others, which makes training harder rather
+        than easier.
+        """
+        n = self.n
+        if self.obs_mode == "basic":
+            return self._observe_basic(n)
+        return self._observe_rich(n)
+
+    def _observe_basic(self, n):
+        out = np.zeros((n, 11), dtype=np.int8)
         for i in range(n):
             hx, hy = int(self.heads[i, 0]), int(self.heads[i, 1])
             d = self.directions[i]
-            left = (hx - BLOCK_SIZE, hy)
-            right = (hx + BLOCK_SIZE, hy)
-            up = (hx, hy - BLOCK_SIZE)
-            down = (hx, hy + BLOCK_SIZE)
-
-            if d == Direction.RIGHT.value:
-                straight, r_turn, l_turn = right, down, up
-            elif d == Direction.DOWN.value:
-                straight, r_turn, l_turn = down, left, up
-            elif d == Direction.LEFT.value:
-                straight, r_turn, l_turn = left, up, down
-            else:  # UP
-                straight, r_turn, l_turn = up, right, left
+            straight, r_turn, l_turn = self._rays(hx, hy, d)
 
             out[i, 0] = self._is_collision(i, *straight)
             out[i, 1] = self._is_collision(i, *r_turn)
@@ -210,6 +223,82 @@ class VecSnake:
             out[i, 9] = fy < hy
             out[i, 10] = fy > hy
         return out
+
+    def _observe_rich(self, n):
+        out = np.zeros((n, 21), dtype=np.int8)
+        bw = self.board.game_w - BLOCK_SIZE
+        bh = self.board.game_h - BLOCK_SIZE
+        cols = max(1, self.board.cols - 1)
+        # Divide distances by 10 so they land in 0..3. The furthest wall on an
+        # 800 by 600 board is 39 cells away, so this keeps them inside a range
+        # the other 0 or 1 features can compete with.
+        scale = 10
+        for i in range(n):
+            hx, hy = int(self.heads[i, 0]), int(self.heads[i, 1])
+            d = self.directions[i]
+            straight, r_turn, l_turn = self._rays(hx, hy, d)
+
+            out[i, 0] = self._is_collision(i, *straight)
+            out[i, 1] = self._is_collision(i, *r_turn)
+            out[i, 2] = self._is_collision(i, *l_turn)
+
+            # Distance to each wall, in scaled cells.
+            out[i, 3] = (hx // BLOCK_SIZE) // scale
+            out[i, 4] = ((bw - hx) // BLOCK_SIZE) // scale
+            out[i, 5] = (hy // BLOCK_SIZE) // scale
+            out[i, 6] = ((bh - hy) // BLOCK_SIZE) // scale
+
+            out[i, 7] = d == Direction.LEFT.value
+            out[i, 8] = d == Direction.RIGHT.value
+            out[i, 9] = d == Direction.UP.value
+            out[i, 10] = d == Direction.DOWN.value
+
+            # Which way the tail is. Tail direction is cheap and it varies.
+            q = self.queues[i]
+            if len(q) >= 2:
+                tx, ty = q[-1]
+                out[i, 11] = tx < hx
+                out[i, 12] = tx > hx
+                out[i, 13] = ty < hy
+                out[i, 14] = ty > hy
+            # Snake length, log scaled to 1..9.
+            #
+            # Honest note: this feature is nearly useless in practice. Measured
+            # over 256,000 observations, raw length during random play sits
+            # between 3 and 5, because a random snake dies almost immediately.
+            # So this is a constant 1 for the whole early game, which is exactly
+            # when a length signal would be worth having. Kept because it costs
+            # nothing once the agent improves and games get longer.
+            out[i, 15] = min(9, int(np.log1p(len(q))))
+
+            fx, fy = int(self.foods[i, 0]), int(self.foods[i, 1])
+            if fx < 0:
+                pass
+            else:
+                out[i, 16] = fx < hx
+                out[i, 17] = fx > hx
+                out[i, 18] = fy < hy
+                out[i, 19] = fy > hy
+                # How far the food is, log scaled. The four bits above say which
+                # way it is, this says how far, which matters for route planning.
+                manhattan = abs(fx - hx) + abs(fy - hy)
+                out[i, 20] = min(9, int(np.log1p(manhattan // BLOCK_SIZE)))
+        return out
+
+    @staticmethod
+    def _rays(hx, hy, d):
+        """Straight, right turn and left turn cells for a head facing d."""
+        left = (hx - BLOCK_SIZE, hy)
+        right = (hx + BLOCK_SIZE, hy)
+        up = (hx, hy - BLOCK_SIZE)
+        down = (hx, hy + BLOCK_SIZE)
+        if d == Direction.RIGHT.value:
+            return right, down, up
+        if d == Direction.DOWN.value:
+            return down, left, up
+        if d == Direction.LEFT.value:
+            return left, up, down
+        return up, right, left
 
     # ---- stepping ---------------------------------------------------------
     def step(self, actions):
@@ -317,8 +406,11 @@ class VecAgent:
         self.device = device
         self.n_games = 0
         self.memory = deque(maxlen=MAX_MEMORY)
+        # Set from the environment by train(), so the network width and the
+        # observation width can never disagree.
+        self.obs_width = VecSnake.WIDTHS["basic"]
         self.model = Linear_QNet(
-            input_size=11,
+            input_size=self.obs_width,
             hidden_size=HIDDEN_SIZE,
             output_size=3,
             hidden_layers=HIDDEN_LAYERS,
@@ -331,7 +423,7 @@ class VecAgent:
     def architecture(self):
         # Shared with the single game script, so a checkpoint written by either
         # one is recognised by the other.
-        return architecture_fingerprint()
+        return architecture_fingerprint(input_size=self.obs_width)
 
     # ---- exploration ------------------------------------------------------
     def epsilon_for(self, episodes):
@@ -465,7 +557,7 @@ def resolve_device(name):
 def train(n_games, total_steps, train_every, device_name, checkpoint,
           best_checkpoint=VEC_BEST_CHECKPOINT, save_every=60.0, quiet=False,
           log_backend="both", run_name=None, log_dir="./runs", report_every=5.0,
-          log_every=1.0):
+          log_every=1.0, obs_mode="basic"):
     """Train the vectorized agent.
 
     Two checkpoint files are kept on purpose:
@@ -486,8 +578,19 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     if device.type == "cuda":
         print(f"=> GPU: {torch.cuda.get_device_name(0)}")
 
-    env = VecSnake(n_games)
+    env = VecSnake(n_games, obs_mode=obs_mode)
     agent = VecAgent(device)
+    # The network width comes from the environment. If these two ever disagree,
+    # the replay samples and the model cannot be multiplied and training raises.
+    agent.obs_width = env.obs_width
+    agent.model = Linear_QNet(
+        input_size=env.obs_width,
+        hidden_size=HIDDEN_SIZE,
+        output_size=3,
+        hidden_layers=HIDDEN_LAYERS,
+    ).to(device)
+    agent.trainer = QTrainer(agent.model, lr=LR, gamma=GAMMA)
+    print(f"=> state vector: {obs_mode}, {env.obs_width} features")
     # Episodes arrive n_games times faster, so the exploration curve has to be
     # stretched out or epsilon would hit the floor in a few hundred steps.
     #
@@ -540,6 +643,8 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                     "games": n_games,
                     "total_steps": total_steps,
                     "train_every": train_every,
+                    "obs_mode": obs_mode,
+                    "obs_width": env.obs_width,
                     "hidden_size": HIDDEN_SIZE,
                     "hidden_layers": HIDDEN_LAYERS,
                     "lr": LR,
@@ -744,7 +849,10 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
 def main():
     p = argparse.ArgumentParser(description="Vectorized Snake DQN")
     p.add_argument("--games", type=int, default=64, help="parallel games (default 64)")
-    p.add_argument("--steps", type=int, default=500_000, help="total environment steps")
+    p.add_argument("--steps", type=int, default=500_000,
+                   help="steps to run THIS TIME, not a lifetime total. Resuming "
+                        "from a 2 million step checkpoint with --steps 1500000 "
+                        "runs 1.5 million MORE steps")
     p.add_argument("--train-every", type=int, default=8,
                    help="run one replay batch every N steps (default 8)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "xpu"])
@@ -765,12 +873,16 @@ def main():
                    help="seconds between console reports (default 5)")
     p.add_argument("--log-every", type=float, default=1.0,
                    help="seconds between logged points on the curves (default 1)")
+    p.add_argument("--state", dest="obs_mode", default="basic",
+                   choices=sorted(VecSnake.WIDTHS),
+                   help="what the agent can see: basic 11 features, or rich 21 "
+                        "with wall distance, tail distance and snake length")
     p.add_argument("--quiet", action="store_true",
                    help="silence the terminal, logging still happens")
     a = p.parse_args()
     train(a.games, a.steps, a.train_every, a.device, a.checkpoint,
           a.best_checkpoint, a.save_every, a.quiet, a.log_backend,
-          a.run_name, a.log_dir, a.report_every, a.log_every)
+          a.run_name, a.log_dir, a.report_every, a.log_every, a.obs_mode)
 
 
 if __name__ == "__main__":

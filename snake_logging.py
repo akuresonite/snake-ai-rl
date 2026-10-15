@@ -315,7 +315,14 @@ class Logger:
 # ==========================================
 
 class NullLogger:
-    """Does nothing, so training code never needs a None check."""
+    """Does nothing, so training code never needs a None check.
+
+    tb is present and None on purpose. add_histogram checks it, and a missing
+    attribute there crashed every run that used --log none. That was a real bug.
+    """
+
+    tb = None
+    mlf = None
 
     def add(self, key, value, step):
         pass
