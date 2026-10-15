@@ -2,20 +2,9 @@ import pygame
 import random
 import numpy as np
 from collections import deque
-from enum import Enum
-from collections import namedtuple
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
 import os
 import io
-
-# Try importing Intel Extension for PyTorch
-try:
-    import intel_extension_for_pytorch as ipex
-except ImportError:
-    ipex = None
 
 # Plotly is optional. Without it (or without kaleido) training still runs,
 # it just skips the chart panel instead of dying on the first game over.
@@ -26,94 +15,46 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-# ==========================================
-# DEVICE CONFIGURATION
-# ==========================================
-def get_device():
-    # Check for CUDA (Nvidia)
-    if torch.cuda.is_available():
-        print(f"Using CUDA Device: {torch.cuda.get_device_name(0)}")
-        return torch.device("cuda")
+# Everything shared with the vectorized trainer lives in snake_core, which is
+# pygame free on purpose so that script can run in an environment without
+# pygame. See snake_core.py.
+from snake_core import (  # noqa: E402
+    BATCH_SIZE,
+    BLOCK_SIZE,
+    DEVICE,
+    DROPOUT_P,
+    EPSILON_DECAY_GAMES,
+    EPSILON_MIN,
+    EPSILON_START,
+    GAMMA,
+    HIDDEN_LAYERS,
+    HIDDEN_SIZE,
+    LR,
+    MAX_MEMORY,
+    REWARD_DEATH,
+    REWARD_FOOD,
+    SNAKE_THREADS,
+    STARVATION_FRAMES_PER_SEGMENT,
+    WEIGHT_DECAY,
+    Direction,
+    Linear_QNet,
+    Point,
+    QTrainer,
+    architecture_fingerprint,
+    set_threads,
+    torch_load_checkpoint,
+)
 
-    # Check for XPU (Intel)
-    try:
-        if ipex and hasattr(torch, 'xpu') and torch.xpu.is_available():
-            print(f"Using Intel XPU: {torch.xpu.get_device_name(0)}")
-            return torch.device("xpu")
-    except Exception:
-        pass
-
-    print("Using CPU")
-    return torch.device("cpu")
-
-DEVICE = get_device()
-
-# ==========================================
-# THREAD CONFIGURATION
-# ==========================================
-# Measured on an RTX 5050 laptop with the 11 -> 128 x2 -> 3 network:
-#
-#   1 thread  : 1595 us per step
-#   2 threads : 2303 us
-#   4 threads : 2603 us
-#   8 threads : 2874 us
-#   16 threads: 2610 us   (the default)
-#
-# More threads made this slower. The model is tiny, so the thread pool setup
-# costs more than the arithmetic it saves. One thread is about 1.6x faster than
-# the default. Override with the SNAKE_THREADS environment variable if you ever
-# train something bigger.
-THREADS = int(os.environ.get("SNAKE_THREADS", "1"))
-
-try:
-    torch.set_num_threads(THREADS)
-except Exception:
-    pass
+# This script trains one sample at a time, and one sample is the case where
+# extra threads hurt. Measured: 1595 us per step on 1 thread against 2610 us on
+# the default 16. The vectorized trainer sets its own default, because its
+# batches are wide and may want the opposite.
+THREADS = set_threads(SNAKE_THREADS if SNAKE_THREADS else 1)
 
 # ==========================================
-# HYPERPARAMETERS
+# RENDERING SETTINGS
 # ==========================================
-# Kept in one place so the values in AGENTS.md and the README stay honest.
-
-# Network shape. The state is 11 binary values on an 88 cell grid, which is
-# close to tabular, so a small network learns faster here than a big one.
-HIDDEN_SIZE = 128
-HIDDEN_LAYERS = 2
-DROPOUT_P = 0.0        # 0 disables dropout entirely
-
-# Optimisation
-LR = 5e-4
-WEIGHT_DECAY = 1e-4
-GAMMA = 0.9
-MAX_MEMORY = 100_000
-BATCH_SIZE = 1000
-
-# Exploration. Multiplicative decay with a floor, rather than a linear ramp
-# that reaches zero and then stays there.
-EPSILON_START = 1.0
-EPSILON_MIN = 0.01
-EPSILON_DECAY_GAMES = 200
-
-# Rewards and episode limits
-REWARD_FOOD = 10.0
-REWARD_DEATH = -10.0
-STARVATION_FRAMES_PER_SEGMENT = 100
-
-# Rendering
-BLOCK_SIZE = 20
 PLOT_UPDATE_EVERY = 5   # games between chart redraws, chart rendering is slow
-
-# ==========================================
-# PART 1: GAME ENVIRONMENT (The World)
-# ==========================================
-
-class Direction(Enum):
-    RIGHT = 1
-    LEFT = 2
-    UP = 3
-    DOWN = 4
-
-Point = namedtuple('Point', 'x, y')
 
 # RGB Colors
 WHITE = (255, 255, 255)
@@ -438,106 +379,10 @@ class SnakeGameAI:
         self.head = Point(int(x), int(y))
 
 # ==========================================
-# PART 2: THE BRAIN (Neural Network)
+# PART 2: THE BRAIN
 # ==========================================
-
-class Linear_QNet(nn.Module):
-    """Small MLP with optional normalisation and dropout.
-
-    The size is driven by HIDDEN_SIZE and HIDDEN_LAYERS at the top of the file.
-    Layer keys are l1, l2, l3 ... so checkpoints stay readable.
-    """
-
-    def __init__(self, input_size, hidden_size, output_size,
-                 hidden_layers=HIDDEN_LAYERS, dropout_p=DROPOUT_P, use_norm=True):
-        super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.hidden_layers = hidden_layers
-        self.dropout_p = dropout_p
-        self.use_norm = use_norm
-
-        sizes = [input_size] + [hidden_size] * hidden_layers
-        for i in range(hidden_layers):
-            setattr(self, f"l{i + 1}", nn.Linear(sizes[i], sizes[i + 1]))
-            if use_norm:
-                setattr(self, f"ln{i + 1}", nn.LayerNorm(sizes[i + 1]))
-        self.l4 = nn.Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(p=dropout_p) if dropout_p > 0 else nn.Identity()
-
-    def forward(self, x):
-        for i in range(self.hidden_layers):
-            x = getattr(self, f"l{i + 1}")(x)
-            if self.use_norm:
-                x = getattr(self, f"ln{i + 1}")(x)
-            x = F.relu(x)
-            x = self.dropout(x)
-        return self.l4(x)
-
-
-class QTrainer:
-    def __init__(self, model, lr, gamma, weight_decay=WEIGHT_DECAY):
-        self.lr = lr
-        self.gamma = gamma
-        self.model = model
-        self.optimizer = optim.AdamW(model.parameters(), lr=self.lr, weight_decay=weight_decay)
-        # Huber loss is far less twitchy than MSE when a TD target overshoots.
-        self.criterion = nn.SmoothL1Loss()
-
-    def train_step(self, state, action, reward, next_state, done):
-        state = torch.as_tensor(np.array(state), dtype=torch.float32, device=DEVICE)
-        next_state = torch.as_tensor(np.array(next_state), dtype=torch.float32, device=DEVICE)
-        reward = torch.as_tensor(np.array(reward), dtype=torch.float32, device=DEVICE)
-        done = torch.as_tensor(np.array(done), dtype=torch.float32, device=DEVICE)
-
-        # Single transition, unsqueeze into a batch of one so the code below has
-        # exactly one shape to worry about.
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-            next_state = next_state.unsqueeze(0)
-            reward = reward.unsqueeze(0)
-            done = done.unsqueeze(0)
-
-        # action arrives as one hot vectors, so the chosen index is just the
-        # argmax. Computed once for the whole batch, the old version did this
-        # inside a Python loop.
-        # A single step passes a 1D list like [1, 0, 0], so flatten first and
-        # let argmax work on the last axis. Otherwise a 1D input has no dim=1
-        # and the call raises IndexError.
-        if torch.is_tensor(action):
-            action_t = action.to(DEVICE)
-        else:
-            action_t = torch.as_tensor(np.array(action), dtype=torch.long, device=DEVICE)
-        action_idx = action_t.reshape(-1, action_t.shape[-1]).argmax(dim=1)
-
-        # 1: Predicted Q values with current state.
-        pred = self.model(state)
-
-        # 2: Q_new = r + gamma * max(next_predicted Q value), only if not done.
-        # The bootstrap target is computed in eval mode under no_grad so dropout
-        # noise stays out of the target and no graph is built for it.
-        with torch.no_grad():
-            was_training = self.model.training
-            self.model.eval()
-            next_q = self.model(next_state)
-            target_q = reward + self.gamma * next_q.max(dim=1).values * (1.0 - done)
-            if was_training:
-                self.model.train()
-
-        # Start from the predictions, then overwrite only the action that was
-        # actually taken, which is what makes this a Q learning target.
-        target = pred.clone()
-        target[torch.arange(pred.size(0), device=DEVICE), action_idx] = target_q
-
-        # 3: Calculate Loss and Backpropagate
-        self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
-        loss.backward()
-        # Gradient clipping keeps the occasional huge TD error from wrecking the
-        # weights.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-        self.optimizer.step()
+# Linear_QNet and QTrainer live in snake_core.py now, which carries no pygame
+# dependency. They are imported at the top of this file.
 
 # ==========================================
 # PART 3: THE AGENT (Orchestrator)
@@ -569,15 +414,10 @@ class Agent:
         self.load_checkpoint()
 
     # Architecture fingerprint, so a checkpoint from a different shaped network
-    # is rejected loudly instead of half loading.
+    # is rejected loudly instead of half loading. Shared with the vectorized
+    # trainer, so both agree on what a matching checkpoint looks like.
     def _architecture(self):
-        return {
-            'input_size': 11,
-            'hidden_size': HIDDEN_SIZE,
-            'hidden_layers': HIDDEN_LAYERS,
-            'output_size': 3,
-            'dropout_p': DROPOUT_P,
-        }
+        return architecture_fingerprint()
 
     def load_checkpoint(self):
         if not os.path.exists(CHECKPOINT_PATH):
@@ -586,7 +426,7 @@ class Agent:
 
         print("=> Loading checkpoint...")
         try:
-            checkpoint = self._torch_load(CHECKPOINT_PATH)
+            checkpoint = torch_load_checkpoint(CHECKPOINT_PATH, DEVICE)
 
             saved_arch = checkpoint.get('architecture')
             if saved_arch is not None and saved_arch != self._architecture():
@@ -612,15 +452,6 @@ class Agent:
         except Exception as e:
             print(f"=> Could not load checkpoint: {type(e).__name__}: {e}")
             print("=> Starting fresh.")
-
-    @staticmethod
-    def _torch_load(path):
-        # Modern PyTorch defaults weights_only=True, which rejects a checkpoint
-        # that carries optimizer state. Try safe first, then fall back.
-        try:
-            return torch.load(path, map_location=DEVICE, weights_only=True)
-        except Exception:
-            return torch.load(path, map_location=DEVICE, weights_only=False)
 
     def save_checkpoint(self):
         model_folder_path = './model'

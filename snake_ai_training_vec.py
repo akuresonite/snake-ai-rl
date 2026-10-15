@@ -33,9 +33,11 @@ from collections import deque
 import numpy as np
 import torch
 
-# Reuse the verified pieces. The network, the trainer and every hyperparameter
-# come from the single game reference script, so the two can never drift.
-from snake_ai_training_Deep import (  # noqa: E402
+# Shared pieces come from snake_core, which is pygame free. Importing the
+# single game script instead would drag pygame in and this script would fail on
+# any environment that has torch but no pygame, which is exactly the case for
+# the CUDA equipped conda envs on this machine.
+from snake_core import (  # noqa: E402
     BATCH_SIZE,
     BLOCK_SIZE,
     DEVICE,
@@ -49,12 +51,21 @@ from snake_ai_training_Deep import (  # noqa: E402
     MAX_MEMORY,
     REWARD_DEATH,
     REWARD_FOOD,
+    SNAKE_THREADS,
     STARVATION_FRAMES_PER_SEGMENT,
     WEIGHT_DECAY,
     Direction,
     Linear_QNet,
     QTrainer,
+    architecture_fingerprint,
+    set_threads,
+    torch_load_checkpoint,
 )
+
+# This script does wide batched work, which is the case where threads can
+# actually help. Unlike the single game script it does not force one thread, so
+# a user on a CUDA box can tune it. Override with SNAKE_THREADS=8 if you like.
+THREADS = set_threads(SNAKE_THREADS) if SNAKE_THREADS else None
 
 VEC_CHECKPOINT = "./model/vec_checkpoint.pth"
 
@@ -311,13 +322,9 @@ class VecAgent:
         self.decay_episodes = float(EPSILON_DECAY_GAMES)
 
     def architecture(self):
-        return {
-            "input_size": 11,
-            "hidden_size": HIDDEN_SIZE,
-            "hidden_layers": HIDDEN_LAYERS,
-            "output_size": 3,
-            "dropout_p": 0.0,
-        }
+        # Shared with the single game script, so a checkpoint written by either
+        # one is recognised by the other.
+        return architecture_fingerprint()
 
     # ---- exploration ------------------------------------------------------
     def epsilon_for(self, episodes):
@@ -368,10 +375,7 @@ class VecAgent:
     # ---- checkpoint -------------------------------------------------------
     @staticmethod
     def _torch_load(path):
-        try:
-            return torch.load(path, map_location=DEVICE, weights_only=True)
-        except Exception:
-            return torch.load(path, map_location=DEVICE, weights_only=False)
+        return torch_load_checkpoint(path, DEVICE)
 
     def load(self, path):
         if not os.path.exists(path):
