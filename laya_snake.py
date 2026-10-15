@@ -295,8 +295,12 @@ def run_policy(agent, episodes, log):
         "own body is the main way it dies.",
         POLICY_QUESTIONS)
     choice = res["answers"]["policy"]["choice"]
-    print(f"  Laya chose: {choice}")
-    log.add("laya/policy_floodfill", 1 if choice == "floodfill" else 0, 1)
+    conf = res["answers"]["policy"].get("answer_confidence")
+    print(f"  Laya chose: {choice}  (confidence {conf})")
+    # Log the choice as a one hot over the three options, so which strategy it
+    # picked is visible on a curve rather than only in the terminal.
+    for opt in ("floodfill", "greedy", "wander"):
+        log.add(f"laya/policy_chose_{opt}", 1 if choice == opt else 0, 1)
 
     def flood_count(game, cell):
         """Reachable empty cells from cell, ignoring the tail moving away."""
@@ -346,15 +350,16 @@ def run_policy(agent, episodes, log):
                 break
         scores.append(g.score)
         print(f"  episode {ep+1}: score {g.score}, {g.steps} moves")
-        log.add("laya/floodfill_episode_score", g.score, ep + 1)
+        log.add(f"laya/{choice}_episode_score", g.score, ep + 1)
 
     print()
-    print(f"  flood fill scores : {scores}")
+    print(f"  {choice} scores    : {scores}")
     print(f"  mean score        : {float(np.mean(scores)):.2f}")
     print(f"  best              : {max(scores)}")
-    print(f"  (this is a SUBMITTED hand written policy, not Laya's own play)")
-    log.add_many({"laya/floodfill_mean": float(np.mean(scores)),
-                  "laya/floodfill_best": float(max(scores))}, episodes)
+    print(f"  NOTE: Laya chose the strategy, but this policy was SUBMITTED by us")
+    print(f"  and written here. Laya selected it, it did not write or play it.")
+    log.add_many({f"laya/{choice}_mean": float(np.mean(scores)),
+                  f"laya/{choice}_best": float(max(scores))}, episodes)
     return scores
 
 

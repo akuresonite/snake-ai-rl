@@ -769,12 +769,19 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     interrupted = False
     stopped_early = False
 
-    # n-step bookkeeping. Reward for a game is summed over n steps and stored
-    # against the observation n steps ago, which is where that return starts.
+    # n-step bookkeeping. The reward is summed over n steps, then the whole
+    # batch is stored at once against the observations that opened the window.
+    #
+    # This is deliberately NOT per game gating. Gating per game stored only
+    # 1/n as many samples, so the replay buffer filled 1/n as fast, so training
+    # started far later and the agent learned nothing. Every n-step run in the
+    # first sweep scored 1 or 2 because of exactly that. Comparing n-step needs
+    # the buffer to fill at the same rate, so the flush is on a shared counter
+    # and it fires for all games together.
     pending_r = np.zeros(n_games, dtype=np.float32)
     track_obs = obs.copy()
     track_act = np.zeros(n_games, dtype=np.int64)
-    steps_since_store = np.zeros(n_games, dtype=np.int32)
+    steps_in_window = 0
 
     # Early stopping state. A new record resets the counter, so a configuration
     # that is still improving keeps running and one that has stalled stops.
@@ -789,21 +796,37 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
             next_obs, rewards, done, scores = env.step(actions)
 
             if n_step > 1:
-                # Accumulate the reward, then store a sample once every n steps,
-                # or at the end of a game, whichever comes first. The sample is
-                # tied to the observation that opened the window, which is where
-                # this n step return starts.
+                # The window is (track_obs, track_act) at the start, and the
+                # reward is the sum over the whole window.
+                #
+                # track_obs and track_act must stay untouched for the whole
+                # window. An earlier version overwrote track_act with the LATEST
+                # action at flush time, so a sample paired an observation with an
+                # action that did not produce its reward. Every n-step run scored
+                # 1 or 2 because of that, and it silently corrupted the data
+                # rather than crashing.
                 pending_r += rewards
-                steps_since_store += 1
-                for i in range(n_games):
-                    if steps_since_store[i] >= n_step or done[i]:
+                steps_in_window += 1
+
+                # A game that ended closes its own window, whatever its length.
+                # Without this a game that dies before the window fills
+                # contributes nothing, which starved the buffer: replay size
+                # 41,413 instead of 100,000 in the first sweep.
+                ended = np.flatnonzero(done)
+                if ended.size and steps_in_window < n_step:
+                    for i in ended:
                         agent.remember_one(track_obs[i], track_act[i],
-                                           float(pending_r[i]), next_obs[i],
-                                           bool(done[i]))
+                                           float(pending_r[i]), next_obs[i], True)
                         pending_r[i] = 0.0
-                        steps_since_store[i] = 0
-                        track_obs[i] = next_obs[i]
-                        track_act[i] = actions[i]
+
+                if steps_in_window >= n_step:
+                    agent.remember_many(track_obs, track_act, pending_r,
+                                        next_obs, done)
+                    pending_r = np.zeros(n_games, dtype=np.float32)
+                    # The next window starts at the state we just reached.
+                    track_obs = next_obs.copy()
+                    track_act = actions.copy()
+                    steps_in_window = 0
             else:
                 # next_obs is the post reset observation for finished games. That
                 # is fine here because done=True makes the bootstrap term fall
@@ -1032,7 +1055,10 @@ def main():
     p.add_argument("--double-dqn", action="store_true",
                    help="online net picks the action, target net scores it")
     p.add_argument("--n-step", type=int, default=1,
-                   help="sum rewards over this many steps when filling replay")
+                   help="EXPERIMENTAL AND NOT WORKING. Every configuration tried "
+                        "scores 1 or 2 against 50 for the baseline, and the cause "
+                        "is not found. Left in place to be debugged, do not use "
+                        "it for a comparison")
     p.add_argument("--tau", type=float, default=0.01,
                    help="Polyak rate for the target network (default 0.01)")
     p.add_argument("--patience", type=int, default=0,
