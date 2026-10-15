@@ -266,6 +266,7 @@ Useful flags:
 | `--run-name` | `run-<timestamp>` | name shown in both UIs |
 | `--log-dir` | `./runs` | where the output goes |
 | `--log-every` | `1` | seconds between points on the curves |
+| `--state` | `basic` | `basic` 11 features, or `rich` 21 features |
 | `--report-every` | `5` | seconds between console reports |
 
 `--steps` is a budget for the current run. Resuming from a 2 million step
@@ -307,6 +308,33 @@ terminal only wants to be readable.
 Diagnostics are averaged into one point per log window. Writing them every
 training step produced about 49,000 rows per metric in a 150,000 step run, which
 made the MLflow store slow to open for no extra information.
+
+### Two state vectors, and which one to use
+
+`--state basic` (the default) gives the agent 11 features: danger in three
+directions, the current direction, and which way the food is.
+
+`--state rich` gives it 21: the same 11, plus scaled distance to each wall,
+which way the tail is, the snake length, and how far away the food is.
+
+Measured, 1.2 million steps, 256 games, 4 seeds each:
+
+| state | features | mean best score | scores |
+|-------|----------|-----------------|--------|
+| basic | 11 | **63.0** | 56, 63, 66, 67 |
+| rich | 21 | 59.8 | 55, 59, 67, 58 |
+
+The richer state is about 3 points worse, and it costs roughly 25 percent of the
+throughput. So the default stays `basic`. The extra information is real, it just
+does not help here.
+
+One of the extra features is provably dead weight. The snake length feature sits
+at a constant 1 for the early game, because a random snake dies within about 5
+moves so its length never gets far past 3. Measured over 256,000 observations,
+raw length stayed between 3 and 5.
+
+The honest conclusion: this agent is not short of information, so handing it more
+is not the way past the plateau. The limit is in how it learns, not what it sees.
 
 ## Requirements
 
