@@ -187,6 +187,14 @@ class QTrainer:
         # Huber loss is far less twitchy than MSE when a TD target overshoots.
         self.criterion = nn.SmoothL1Loss()
 
+        # Diagnostics, read by the logging layer. Left as None so that a caller
+        # who does not log pays nothing for them. One float per step is cheap.
+        self.last_loss = None
+        self.last_grad_norm = None
+        self.last_q_mean = None
+        self.last_q_max = None
+        self.last_target_mean = None
+
     def train_step(self, state, action, reward, next_state, done):
         device = next(self.model.parameters()).device
 
@@ -239,8 +247,17 @@ class QTrainer:
         loss.backward()
         # Gradient clipping keeps the occasional huge TD error from wrecking the
         # weights.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
         self.optimizer.step()
+
+        # Record diagnostics without any extra forward or backward pass. A
+        # collapsed grad norm here is the signal that learning has stalled, and
+        # it is invisible if you only watch the score.
+        self.last_loss = float(loss.detach())
+        self.last_grad_norm = float(grad_norm)
+        self.last_q_mean = float(pred.mean().detach())
+        self.last_q_max = float(pred.max().detach())
+        self.last_target_mean = float(target_q.mean().detach())
 
 
 # ==========================================

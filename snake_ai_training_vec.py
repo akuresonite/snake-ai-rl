@@ -62,6 +62,8 @@ from snake_core import (  # noqa: E402
     torch_load_checkpoint,
 )
 
+from snake_logging import Logger, NullLogger, add_histogram  # noqa: E402
+
 # This script does wide batched work, which is the case where threads can
 # actually help. Unlike the single game script it does not force one thread, so
 # a user on a CUDA box can tune it. Override with SNAKE_THREADS=8 if you like.
@@ -113,6 +115,8 @@ class VecSnake:
         self.steps = 0
         self.episodes = 0
         self.episode_returns = deque(maxlen=200)
+        self.episode_scores = deque(maxlen=200)
+        self.episode_lengths = deque(maxlen=200)
         self.episode_best = 0
         self._returns = np.zeros(n_games, dtype=np.float32)
         self.reset()
@@ -296,6 +300,8 @@ class VecSnake:
     def _finish(self, idx, score, reward):
         self.episodes += 1
         self.episode_returns.append(float(self._returns[idx]))
+        self.episode_scores.append(int(score))
+        self.episode_lengths.append(int(self.frames[idx]))
         if score > self.episode_best:
             self.episode_best = int(score)
 
@@ -457,7 +463,9 @@ def resolve_device(name):
 
 
 def train(n_games, total_steps, train_every, device_name, checkpoint,
-          best_checkpoint=VEC_BEST_CHECKPOINT, save_every=60.0, quiet=False):
+          best_checkpoint=VEC_BEST_CHECKPOINT, save_every=60.0, quiet=False,
+          log_backend="both", run_name=None, log_dir="./runs", report_every=5.0,
+          log_every=1.0):
     """Train the vectorized agent.
 
     Two checkpoint files are kept on purpose:
@@ -468,6 +476,10 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     They are separate because the latest file is what you resume from, and the
     best file is what you show off. If they were one file, a lucky random game
     early in training could overwrite a genuinely good model.
+
+    Curves go to TensorBoard and MLflow. Set log_backend to "none" to skip both,
+    or "tensorboard" / "mlflow" for just one. quiet only silences the terminal,
+    it does not stop the logging.
     """
     device = resolve_device(device_name)
     print(f"=> {n_games} parallel games on {device}")
@@ -484,21 +496,70 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     # whole speed advantage on random flailing. Scaling by sqrt(n_games) keeps
     # the useful part of the curve reachable while still exploring enough.
     agent.decay_episodes = EPSILON_DECAY_GAMES * (n_games ** 0.5)
-    print(f"=> epsilon decays over {agent.decay_episodes:,.0f} episodes "
-          f"({EPSILON_DECAY_GAMES} x sqrt({n_games}))")
 
     # Resume from the latest state if there is one, otherwise from the best
     # model file. They are different files now, see the comments in the loop.
-    agent.load_any(checkpoint, best_checkpoint)
+    resumed = agent.load_any(checkpoint, best_checkpoint)
+
+    # Continue the step axis and the episode axis across a resume, so the curves
+    # in TensorBoard and MLflow line up instead of restarting from zero.
+    steps_done = 0
+    episode_offset = 0
+    if resumed:
+        try:
+            prev = agent._torch_load(checkpoint if os.path.exists(checkpoint) else best_checkpoint)
+            steps_done = int(prev.get("steps", 0))
+            episode_offset = int(agent.n_games)
+        except Exception:
+            steps_done = 0
+            episode_offset = 0
+
+    # ---- logging ---------------------------------------------------------
+    if log_backend == "none":
+        log = NullLogger()
+    else:
+        try:
+            log = Logger(
+                backend=log_backend,
+                run_name=run_name,
+                log_dir=log_dir,
+                params={
+                    "games": n_games,
+                    "total_steps": total_steps,
+                    "train_every": train_every,
+                    "hidden_size": HIDDEN_SIZE,
+                    "hidden_layers": HIDDEN_LAYERS,
+                    "lr": LR,
+                    "gamma": GAMMA,
+                    "batch_size": BATCH_SIZE,
+                    "max_memory": MAX_MEMORY,
+                    "epsilon_min": EPSILON_MIN,
+                    "epsilon_decay_episodes": agent.decay_episodes,
+                    "reward_food": REWARD_FOOD,
+                    "reward_death": REWARD_DEATH,
+                    "device": str(device),
+                    "torch_threads": torch.get_num_threads(),
+                    "resumed_from_step": steps_done,
+                },
+            )
+        except Exception as e:
+            print(f"=> WARNING: logging disabled ({type(e).__name__}: {e})")
+            log = NullLogger()
+
+    if not quiet:
+        print(f"=> epsilon decays over {agent.decay_episodes:,.0f} episodes "
+              f"({EPSILON_DECAY_GAMES} x sqrt({n_games}))")
 
     obs = env.observe()
     next_train = train_every
     t0 = time.perf_counter()
     last_report = t0
+    last_log = t0
     last_save = t0
-    report_step = 0
-    steps_done = 0
+    report_step = steps_done
+    log_step = steps_done
     train_calls = 0
+    diag_acc = {}
     interrupted = False
 
     try:
@@ -515,15 +576,24 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
 
             # Score keeping for the games that just ended.
             for i in np.flatnonzero(done):
-                agent.n_games += 1
                 s = int(scores[i])
-                agent.total_score += s
+                # Set the record before n_games moves, so a checkpoint saved
+                # right here carries a game count that matches its score.
                 if s > agent.record:
                     # A new record goes to its own file. The latest file is
                     # written on a timer below, so a lucky random game that sets
                     # a high score early cannot cost you the good model.
                     agent.record = s
                     agent.save(best_checkpoint, extra={"steps": steps_done})
+                    log.add("episode/best_score", s, episode_offset + agent.n_games + 1)
+                    print(f"  [record] {s} at episode {episode_offset + agent.n_games + 1}, "
+                          f"step {steps_done:,}")
+                agent.n_games += 1
+                agent.total_score += s
+                # Log every finished episode against its own episode counter, so
+                # the score curve is per episode rather than an average that
+                # hides the spread.
+                log.add("episode/score", s, episode_offset + agent.n_games)
 
             obs = next_obs
             steps_done += n_games
@@ -532,6 +602,21 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                 agent.train_on_replay()
                 train_calls += 1
                 next_train += train_every
+                # Diagnostics are ACCUMULATED here and averaged into one point
+                # per report below. Writing them every step produced 49,000 rows
+                # per metric in a 150,000 step run, which makes the MLflow store
+                # enormous and slow to open. The averaged curve shows the same
+                # trend.
+                tr = agent.trainer
+                for key, value in (
+                    ("loss", tr.last_loss),
+                    ("grad_norm", tr.last_grad_norm),
+                    ("q_mean", tr.last_q_mean),
+                    ("q_max", tr.last_q_max),
+                    ("target_mean", tr.last_target_mean),
+                ):
+                    if value is not None:
+                        diag_acc.setdefault(key, []).append(float(value))
 
             now = time.perf_counter()
 
@@ -541,18 +626,56 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
             if now - last_save >= save_every:
                 agent.save(checkpoint, extra={"steps": steps_done})
                 last_save = now
-                if not quiet:
-                    print(f"  [saved] {checkpoint} at {steps_done:,} steps, "
-                          f"best {agent.record}")
+                print(f"  [saved] step {steps_done:,}, best {agent.record}")
 
-            if not quiet and now - last_report >= 10.0:
-                sps = (steps_done - report_step) / (now - last_report)
-                recent = env.episode_returns
-                avg_ret = float(np.mean(recent)) if recent else 0.0
+            # Scalar block for the CURVES, on its own shorter cadence.
+            #
+            # This is deliberately separate from the console report below. When
+            # both were on the same 10 second timer, a short run logged only two
+            # points per metric, which is not a curve. The curves want frequent
+            # points; the terminal only wants to be readable.
+            if now - last_log >= log_every:
+                sps = (steps_done - log_step) / (now - last_log)
+                log_step = steps_done
+                recent_r = env.episode_returns
+                recent_s = env.episode_scores
+                recent_l = env.episode_lengths
+
+                log.add_many({
+                    "progress/steps": steps_done,
+                    "progress/episodes": episode_offset + agent.n_games,
+                    "progress/wall_clock_s": now - t0,
+                    "throughput/steps_per_s": sps,
+                    "explore/epsilon": eps,
+                    "replay/size": len(agent.memory),
+                    "replay/train_calls": train_calls,
+                    "episode/return_mean_200": float(np.mean(recent_r)) if recent_r else 0.0,
+                    "episode/score_mean_200": float(np.mean(recent_s)) if recent_s else 0.0,
+                    "episode/score_max_200": float(max(recent_s)) if recent_s else 0.0,
+                    "episode/length_mean_200": float(np.mean(recent_l)) if recent_l else 0.0,
+                    "episode/best_score": agent.record,
+                }, steps_done)
+
+                # One averaged point per diagnostic per log window, instead of
+                # one per training step.
+                if diag_acc:
+                    log.add_many(
+                        {f"train/{k}_mean": float(np.mean(v)) for k, v in diag_acc.items() if v},
+                        steps_done,
+                    )
+                    diag_acc.clear()
+                log.maybe_flush()
+                last_log = now
+
+            # Console report, on its own slower cadence.
+            if not quiet and now - last_report >= report_every:
+                sps_print = (steps_done - report_step) / (now - last_report)
+                recent_r = env.episode_returns
+                avg_ret = float(np.mean(recent_r)) if recent_r else 0.0
                 print(
                     f"steps {steps_done:>10,} | games {agent.n_games:>7,} | "
                     f"eps {eps:.3f} | best {agent.record:>3} | "
-                    f"avg return {avg_ret:6.2f} | {sps:8,.0f} steps/s | "
+                    f"avg return {avg_ret:6.2f} | {sps_print:8,.0f} steps/s | "
                     f"replay {len(agent.memory):>6,}"
                 )
                 last_report = now
@@ -568,19 +691,37 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     # the user stopped it.
     agent.save(checkpoint, extra={"steps": steps_done})
 
-    recent = env.episode_returns
+    recent_r = env.episode_returns
+    recent_s = env.episode_scores
+    recent_l = env.episode_lengths
+    sps = steps_done / max(elapsed, 1e-9)
+
+    log.add_many({
+        "progress/steps": steps_done,
+        "progress/episodes": episode_offset + agent.n_games,
+        "progress/wall_clock_s": elapsed,
+        "throughput/steps_per_s": sps,
+        "episode/best_score": agent.record,
+        "episode/return_mean_200": float(np.mean(recent_r)) if recent_r else 0.0,
+        "episode/score_mean_200": float(np.mean(recent_s)) if recent_s else 0.0,
+        "episode/length_mean_200": float(np.mean(recent_l)) if recent_l else 0.0,
+    }, steps_done)
+    add_histogram(log, "episode/return_hist", list(recent_r), steps_done)
+    add_histogram(log, "episode/score_hist", list(recent_s), steps_done)
+    log.close()
+
     print("-" * 72)
     print(f"{'stopped' if interrupted else 'finished'} at {steps_done:,} steps "
           f"in {elapsed:.1f}s")
-    print(f"  throughput     : {steps_done/max(elapsed, 1e-9):,.0f} steps/s")
+    print(f"  throughput     : {sps:,.0f} steps/s")
     print(f"  games finished : {agent.n_games}")
     print(f"  best score     : {agent.record}")
-    print(f"  avg return     : {float(np.mean(recent)) if recent else 0.0:.2f} (last {len(recent)} games)")
+    print(f"  avg return     : {float(np.mean(recent_r)) if recent_r else 0.0:.2f} (last {len(recent_r)} games)")
     print(f"  replay size    : {len(agent.memory):,}")
     print(f"  train calls    : {train_calls:,}")
     print(f"  latest file    : {checkpoint}")
     print(f"  best file      : {best_checkpoint}")
-    return steps_done / max(elapsed, 1e-9)
+    return sps
 
 
 def main():
@@ -596,10 +737,23 @@ def main():
                    help="model that held the record score, kept separately")
     p.add_argument("--save-every", type=float, default=60.0,
                    help="seconds between latest state saves (default 60)")
-    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--log", dest="log_backend", default="both",
+                   choices=["both", "tensorboard", "mlflow", "none"],
+                   help="where the curves go (default both)")
+    p.add_argument("--run-name", default=None,
+                   help="name for this run, defaults to run-<timestamp>")
+    p.add_argument("--log-dir", default="./runs",
+                   help="folder for tensorboard and mlflow output (default ./runs)")
+    p.add_argument("--report-every", type=float, default=5.0,
+                   help="seconds between console reports (default 5)")
+    p.add_argument("--log-every", type=float, default=1.0,
+                   help="seconds between logged points on the curves (default 1)")
+    p.add_argument("--quiet", action="store_true",
+                   help="silence the terminal, logging still happens")
     a = p.parse_args()
     train(a.games, a.steps, a.train_every, a.device, a.checkpoint,
-          a.best_checkpoint, a.save_every, a.quiet)
+          a.best_checkpoint, a.save_every, a.quiet, a.log_backend,
+          a.run_name, a.log_dir, a.report_every, a.log_every)
 
 
 if __name__ == "__main__":

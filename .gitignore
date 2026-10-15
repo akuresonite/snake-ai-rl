@@ -16,6 +16,12 @@ checkpoints/
 runs/
 logs/
 *.log
+*.tmp
+
+# TensorBoard and MLflow output
+runs/
+mlruns/
+events.out.tfevents.*
 
 # Plotly / kaleido cache
 .kaleido/
