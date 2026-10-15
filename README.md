@@ -229,15 +229,55 @@ mlflow ui --backend-store-uri runs/mlruns
 If you do not have the mlflow package, the files are still written and the UI
 will read them the moment you install it. Nothing is lost.
 
+**TensorBoard showing an empty page.** The usual cause is that no run has
+happened yet, so `runs/` is empty or missing. TensorBoard does not warn about
+this, it just shows nothing. Check first:
+
+```
+dir runs
+```
+
+If it is empty, run training once and then refresh the browser. Give TensorBoard
+about 30 seconds to load. Always start it from the project root, with the log
+directory as `runs`:
+
+```
+tensorboard --logdir runs
+```
+
+To confirm TensorBoard can actually see your metrics, ask its own API:
+
+```
+curl "http://localhost:6006/data/plugin/scalars/tags"
+```
+
+You should get a list of metric names back. If that list is empty, the problem is
+that there is no event file, not that the browser is stale.
+
+The trainer prints a note at startup when the run folder was empty before, so
+this is visible in the terminal now rather than only in the browser.
+
 Useful flags:
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--steps` | `500000` | how many steps to run **this time**, not a lifetime total |
 | `--log` | `both` | `both`, `tensorboard`, `mlflow` or `none` |
 | `--run-name` | `run-<timestamp>` | name shown in both UIs |
 | `--log-dir` | `./runs` | where the output goes |
 | `--log-every` | `1` | seconds between points on the curves |
 | `--report-every` | `5` | seconds between console reports |
+
+`--steps` is a budget for the current run. Resuming from a 2 million step
+checkpoint with `--steps 1500000` runs 1.5 million **more** steps, it does not
+conclude that the target was already reached. The curves use the cumulative step
+count so they line up across runs, and `progress/run_steps` gives the per run
+count. A run that resumed correctly prints both numbers:
+
+```
+=> resuming after 2,000,128 previous steps, running 1,500,000 more
+finished after 1,500,160 steps in this run, 3,500,288 total, in 77.9s
+```
 
 The two intervals are separate on purpose. The curves want frequent points, the
 terminal only wants to be readable.
@@ -260,7 +300,9 @@ terminal only wants to be readable.
 | `train/q_mean_mean`, `train/q_max_mean`, `train/target_mean_mean` | value estimates |
 | `throughput/steps_per_s` | speed, so you can see a regression when you change something |
 | `replay/size`, `replay/train_calls` | buffer filling up |
-| `progress/steps`, `progress/episodes`, `progress_wall_clock_s` | axes and timing |
+| `progress/steps` | cumulative across every run, the axis for the curves |
+| `progress/run_steps` | steps in the current run only |
+| `progress/episodes`, `progress/wall_clock_s` | episode axis and timing |
 
 Diagnostics are averaged into one point per log window. Writing them every
 training step produced about 49,000 rows per metric in a 150,000 step run, which
