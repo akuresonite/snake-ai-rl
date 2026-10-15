@@ -146,15 +146,30 @@ runs on one core, so 128 games measured barely faster than 64.
 ### Running it on a GPU
 
 The batched design is what finally makes a GPU worthwhile, because the batch is
-always wide. A CUDA capable environment is needed:
+always wide. Measured, 200,000 steps, 256 games, same code:
+
+| Device | Throughput |
+|--------|------------|
+| CPU, base env | 7,387 steps/s |
+| GPU, RTX 5050, whisX env | 9,250 steps/s |
+
+That is about 25 percent faster on the GPU. Not a huge margin, and the reason is
+worth knowing: the game rules are plain Python and run on one CPU core, so the
+GPU spends most of its time waiting. Raising `--games` does not fix that. On the
+GPU, 128 games gave 4,434 steps/s and 512 games gave 9,527, so it flattens out
+around 256.
+
+To use the GPU you need a Python environment with CUDA torch. On this machine:
 
 ```
-python snake_ai_training_vec.py --games 256 --device cuda
+C:\Users\akure\miniconda3\envs\whisX\python.exe snake_ai_training_vec.py --games 256 --device cuda
 ```
 
-Your conda `whisX`, `joycaption` and `pinclass` environments have CUDA torch
-that supports this card. None of them have `pygame`, which this script does not
-need at all, since it never opens a window.
+`whisX`, `joycaption` and `pinclass` all have CUDA torch that supports this
+card. None of them have `pygame`, and they do not need it, because this script
+imports its shared code from `snake_core.py`, which is deliberately pygame free.
+Do not use `audiosr`: its torch reports CUDA as available but has no kernel for
+this GPU generation, so it fails at the first real calculation.
 
 ## Requirements
 
@@ -215,6 +230,7 @@ regardless. Model weights are gitignored, so you will not find them in this repo
 ## Layout
 
 ```
+snake_core.py                shared pygame free core, imported by both below
 snake_ai_training.py         original single window version
 snake_ai_training2.py        dashboard UI, baseline shallow network
 snake_ai_training_Deep.py    reference implementation, one game at a time
@@ -224,6 +240,12 @@ requirements.txt             runtime dependencies
 .gitattributes               pins LF line endings across platforms
 LICENSE                      MIT
 ```
+
+`snake_core.py` holds the network, the trainer, every hyperparameter and the
+checkpoint helpers. It imports no pygame, on purpose. The single game script
+adds the window and the chart, and the vectorized script adds the parallel
+environment. A checkpoint written by either script loads in the other, because
+the architecture fingerprint is shared.
 
 The owner also keeps a local `AGENTS.md` with contributor rules and the current
 configuration. It is deliberately gitignored and not part of this repository.
