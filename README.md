@@ -10,20 +10,20 @@ hand rolled so every moving part stays readable.
 Three iterations live side by side. They were written in order and each one
 supersedes the last.
 
-| Script | Written | Lines | Network | Optimizer | UI |
-|--------|---------|-------|---------|-----------|-----|
-| `snake_ai_training.py` | Dec 3, 2025 | 490 | 11 to 256 to 3, single hidden layer | Adam, lr 0.001 | Single window, matplotlib live plot, fixed 40 fps |
-| `snake_ai_training2.py` | Dec 5, 2025 | 602 | 11 to 256 to 3, single hidden layer | Adam, lr 0.001 | Three panel dashboard, embedded Plotly chart, speed slider, scrollable history |
-| `snake_ai_training_Deep.py` | Dec 6, 2025 | 628 | 11 to 256 to 256 to 256 to 3, LayerNorm and dropout | AdamW, lr 0.01 | Same three panel dashboard as above |
+| Script | Written | Network | Optimizer | UI |
+|--------|---------|---------|-----------|-----|
+| `snake_ai_training.py` | Dec 3, 2025 | 11 to 256 to 3, single hidden layer | Adam, lr 0.001 | Single window, matplotlib live plot, fixed 40 fps |
+| `snake_ai_training2.py` | Dec 5, 2025 | 11 to 256 to 3, single hidden layer | Adam, lr 0.001 | Three panel dashboard, embedded Plotly chart, speed slider, scrollable history |
+| `snake_ai_training_Deep.py` | Dec 6, 2025 | 11 to 128 to 128 to 3, LayerNorm, no dropout | AdamW, lr 0.0005 | Same three panel dashboard as above |
 
 **`snake_ai_training_Deep.py` is the superior script and the one to run.** It is a
 strict superset of `snake_ai_training2.py`: everything that file does, it does
-too, plus a deeper regularized network, a better optimizer and its own checkpoint
+too, plus a better optimizer, a corrected training step and its own checkpoint
 file so the two models can be trained without clobbering each other.
 
 `snake_ai_training2.py` is worth keeping as the baseline. It is the honest
-comparison point for any claim about the deep network, because its environment,
-rewards, replay buffer and UI are byte for byte the same.
+comparison point for any claim about the reference network, because its
+environment, rewards, replay buffer and UI are byte for byte the same.
 
 `snake_ai_training.py` is the earliest version and is superseded on every axis.
 
@@ -34,47 +34,66 @@ vector, the `+10` food reward, the `-10` death reward, the starvation guard at
 `100 * len(snake)` frames, the `100000` entry replay buffer and the `1000`
 sample batch size.
 
-The only real divergence is the function approximator and its optimizer:
+The divergence is the function approximator, its optimizer and the shape of the
+training step:
 
-- **Reference net.** Three hidden layers of 256 units, each followed by
-  `LayerNorm` and `ReLU`, with `Dropout(0.1)` between layers. Four `Linear`
-  layers total.
-- **Baseline net.** One hidden layer of 256 units with `ReLU`. Two `Linear`
-  layers total.
-- **Optimizer.** `AdamW` at `lr=0.01` in the reference, plain `Adam` at
-  `lr=0.001` in the baseline and the original.
+- **Reference net.** Two hidden layers of 128 units, each followed by
+  `LayerNorm` and `ReLU`. No dropout.
+- **Baseline net.** One hidden layer of 256 units with `ReLU`.
+- **Optimizer.** `AdamW` at `lr=0.0005` with `weight_decay=1e-4` in the
+  reference, plain `Adam` at `lr=0.001` in the baseline and the original.
+- **Loss.** `SmoothL1Loss` (Huber) in the reference, `MSELoss` in the other two.
 
-### Honest caveats about the reference script
+### How the reference script was fixed
 
-Being the best of the three is not the same as being optimal. These are real
-weaknesses, listed so nobody mistakes the lineage for a finished design.
+The first version of the reference script had real defects. They are corrected
+now, and the fixes are worth knowing about because they change results:
 
-1. **Dropout is active while the target Q-values are computed.** In
-   `QTrainer.train_step`, the bootstrap target calls `self.model(next_state[idx])`
-   with the model still in training mode, so dropout noise leaks into the
-   regression target. Wrapping that call in `torch.no_grad()` and a `model.eval()`
-   block is the standard fix and would likely improve stability more than the
-   extra depth does.
-2. **The network is oversized for the problem.** An 11 value binary input on an
-   88 cell grid does not need three 256 unit layers with regularization. For
-   tabular scale state spaces this much capacity tends to slow learning down
-   rather than help it.
-3. **`torch.argmax(action[idx])` is redundant.** `action` is already a one hot
-   vector, so the argmax is just an indirect way of writing the chosen index.
-   `action[idx].item()` says the same thing directly.
-4. **Per sample forward passes in a Python loop.** The target computation calls
-   the model once per batch element. A single vectorized forward pass over
-   `next_state` would be dramatically faster.
-5. **The epsilon schedule is tied to game count, not steps.** `80 - n_games`
-   compared against `randint(0, 200)` means exploration is fully annealed after
-   80 games, and it goes to zero rather than holding at a floor.
-6. **Head coordinates are floats.** `Point(self.game_w / 2, ...)` yields float
-   coordinates, which works but is fragile. Integer division would be safer.
-7. **The dashboard needs `kaleido`.** `plotly.io.to_image` raises on the first
-   game over without it, and the call blocks the training loop while it renders.
-8. **Loading a checkpoint needs `weights_only=False` on modern PyTorch.** The
-   checkpoint dict contains optimizer state, so the default in recent versions
-   will refuse it.
+1. **Dropout was corrupting the target.** The bootstrap target ran with the
+   model still in training mode, so dropout noise leaked into the regression
+   target. The target now runs under `torch.no_grad()` with the model in
+   `eval()` mode. Dropout is also removed entirely, since with a clean target
+   its only remaining effect was noise.
+2. **One forward pass per batch element.** The target looped over the batch in
+   Python, up to 1000 model calls per game over. It is now one vectorized pass
+   over the whole batch.
+3. **`torch.argmax(action[idx])`** was an indirect way to write the chosen
+   action index. It is now computed once for the whole batch.
+4. **`torch.load` on modern PyTorch.** The checkpoint carries optimizer state,
+   which the new `weights_only=True` default rejects. The loader tries the safe
+   path first and falls back.
+5. **Exploration collapsed to zero.** The old `80 - n_games` schedule went
+   negative and pinned to pure greed. It is now a multiplicative decay to a
+   `0.01` floor over 200 games.
+6. **The network was oversized.** Three 256 unit layers on an 11 value binary
+   input is far more capacity than the problem needs. The reference net is now
+   128 by 128, which is 18,947 parameters instead of 136,963.
+7. **Recursive food placement.** `_place_food` called itself when it landed on
+   the snake, which risks a stack overflow on a nearly full board and loops
+   forever on a full one. It is now iterative, and a full board ends the episode.
+8. **Float head coordinates.** `Point(self.game_w / 2, ...)` produced floats,
+   which makes `Point` equality and hashing fragile. Coordinates are integers.
+9. **A missing `kaleido` killed the run** at the first game over, because
+   `plotly.io.to_image` raises. Plotly is now optional, a render failure warns
+   once and training continues without the chart panel.
+10. **Chart rendering blocked training** on every game over. It is throttled to
+    every 5 games, and a final PNG is written on Ctrl+C.
+11. **Font surfaces were rebuilt every frame.** The score label is now cached
+    against the score value.
+12. **`is_collision` and the state builder hardcoded `20`.** Both use
+    `BLOCK_SIZE` now.
+
+### Known limits that remain
+
+Not defects, just things a reader should know:
+
+- **No target network.** Standard DQN keeps a slowly synced copy of the network
+  to compute targets. This code bootstraps from the online network, which is
+  less stable. That is the single biggest remaining improvement.
+- **The replay buffer is not saved.** A restart loses all memories.
+- **No reward shaping.** The reward is still `+10` for food and `-10` for death.
+- **Learning rate and size are choices, not proofs.** The reference net has not
+  been benchmarked against the baseline in a controlled run.
 
 ## Requirements
 
@@ -98,8 +117,17 @@ Optional, for Intel GPU acceleration:
 intel_extension_for_pytorch
 ```
 
-The code targets Python 3.14 and picks its compute device automatically: CUDA
-first, then Intel XPU if IPEX is present, then CPU.
+The code targets Python 3.13 and up. It picks its compute device automatically:
+CUDA first, then Intel XPU if IPEX is present, then CPU.
+
+On this machine the working interpreter is the conda one, because the Python on
+`PATH` has no torch:
+
+```bash
+C:\Users\akure\miniconda3\python.exe snake_ai_training_Deep.py
+```
+
+That interpreter reports torch 2.8.0, pygame 2.6.1 and numpy 2.2.6.
 
 ## Running it
 
@@ -108,7 +136,12 @@ python snake_ai_training_Deep.py
 ```
 
 Training starts immediately and resumes from `model/deep_checkpoint.pth` if that
-file exists. Press Ctrl+C to stop, which saves the current state on the way out.
+file exists and matches the current network shape. Press Ctrl+C to stop, which
+saves the current state on the way out.
+
+If the checkpoint was saved by a different network shape, the script prints both
+shapes and starts fresh. It never half loads, and it never overwrites the old
+file unless training reaches a new record.
 
 The window is split into three panels: training history on the left, the game in
 the middle, and a live Plotly chart of score and mean score on the right. Drag
