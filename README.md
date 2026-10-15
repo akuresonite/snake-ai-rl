@@ -171,6 +171,38 @@ imports its shared code from `snake_core.py`, which is deliberately pygame free.
 Do not use `audiosr`: its torch reports CUDA as available but has no kernel for
 this GPU generation, so it fails at the first real calculation.
 
+### Checkpoints, and why there are two files
+
+The vectorized trainer keeps two files, and they mean different things:
+
+| File | Written when | Use it for |
+|------|--------------|------------|
+| `model/vec_checkpoint.pth` | every 60 seconds, and on Ctrl+C, and at the end | resuming |
+| `model/vec_best.pth` | only when a game sets a new record score | showing off the best model |
+
+They are separate on purpose. A single file cannot be both, and here is the
+problem with trying. The record score can be set by a **lucky random game**
+early in training. Because a single file only gets written when a record falls,
+that lucky value then blocks any save until a genuinely good model beats it. So
+on Ctrl+C you would lose everything back to that lucky game.
+
+Two consequences worth knowing:
+
+- **Ctrl+C is safe.** The handler saves the latest state before exiting. Before
+  this change, stopping a long GPU run threw away everything since the last
+  record.
+- **The best file is not a snapshot of the record game.** The save happens at
+  the end of the game, after the model has already been trained on that game.
+  So it holds the weights just after the record run, not the weights that
+  produced it. That is usually better, since the model keeps improving.
+
+Saves are atomic. The file is written to a temporary path and then renamed, so
+an interrupted write leaves either the old file or the new one, never a broken
+one that fails to load.
+
+Resuming checks the latest file first and falls back to the best file, so either
+one can start a run.
+
 ## Requirements
 
 ```
