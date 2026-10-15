@@ -79,6 +79,12 @@ weaknesses, listed so nobody mistakes the lineage for a finished design.
 ## Requirements
 
 ```
+pip install -r requirements.txt
+```
+
+Which covers:
+
+```
 torch
 pygame
 numpy
@@ -119,9 +125,14 @@ snake_ai_training.py         original single window version
 snake_ai_training2.py        dashboard UI, baseline shallow network
 snake_ai_training_Deep.py    reference implementation
 model/                       checkpoint directory, contents gitignored
-AGENTS.md                    contributor rules and configuration
+requirements.txt             runtime dependencies
+.gitattributes               pins LF line endings across platforms
+LICENSE                      MIT
 ```
+
+The owner also keeps a local `AGENTS.md` with contributor rules and the current
+configuration. It is deliberately gitignored and not part of this repository.
 
 ## License
 
-No license file yet. Treat the code as all rights reserved until one is added.
+MIT, see [LICENSE](LICENSE).
