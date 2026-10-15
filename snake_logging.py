@@ -175,6 +175,22 @@ class Logger:
             from torch.utils.tensorboard import SummaryWriter
             self._tb_dir = os.path.join(self.log_dir, self.run_name, "tensorboard")
             self.tb = SummaryWriter(log_dir=self._tb_dir)
+
+            # Guard against a silently empty dashboard. If the whole log dir was
+            # empty before this run started, then the user has probably opened
+            # tensorboard before training anything, seen a blank page, and
+            # concluded it is broken. Say so out loud instead.
+            parent = os.path.join(self.log_dir, self.run_name)
+            try:
+                events = [f for f in os.listdir(self._tb_dir) if f.startswith("events.out.tfevents")]
+            except OSError:
+                events = []
+            if len(events) <= 1:
+                print(f"=> note: {parent} held no previous runs.")
+                print(f"   if TensorBoard showed nothing before, it was pointed at")
+                print(f"   an empty folder. Start it from the project root:")
+                print(f"       tensorboard --logdir {self.log_dir}")
+                print(f"   and give it about 30 seconds to load.")
         except Exception as e:
             self._warn_once("tensorboard",
                             f"TensorBoard unavailable ({type(e).__name__}). "

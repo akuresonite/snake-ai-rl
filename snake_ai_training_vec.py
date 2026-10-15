@@ -501,18 +501,31 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     # model file. They are different files now, see the comments in the loop.
     resumed = agent.load_any(checkpoint, best_checkpoint)
 
-    # Continue the step axis and the episode axis across a resume, so the curves
-    # in TensorBoard and MLflow line up instead of restarting from zero.
-    steps_done = 0
+    # Two different step counters, and confusing them was a real bug.
+    #
+    #   resume_steps  how many steps happened before this run, ever
+    #   steps_done    how many steps have happened IN THIS RUN
+    #
+    # --steps is a budget for THIS RUN, not a cumulative target. It used to be
+    # treated as cumulative, so resuming from a 2,000,128 step checkpoint with
+    # --steps 1500000 ran ZERO steps and exited instantly with an absurd
+    # throughput number. The curves use the cumulative axis so they line up
+    # across runs; the loop and the speed numbers use the per run counter.
+    resume_steps = 0
     episode_offset = 0
     if resumed:
         try:
             prev = agent._torch_load(checkpoint if os.path.exists(checkpoint) else best_checkpoint)
-            steps_done = int(prev.get("steps", 0))
+            resume_steps = int(prev.get("steps", 0))
             episode_offset = int(agent.n_games)
+            print(f"=> resuming after {resume_steps:,} previous steps, "
+                  f"running {total_steps:,} more")
         except Exception:
-            steps_done = 0
+            resume_steps = 0
             episode_offset = 0
+
+    steps_done = 0
+    total_seen = resume_steps
 
     # ---- logging ---------------------------------------------------------
     if log_backend == "none":
@@ -539,7 +552,7 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                     "reward_death": REWARD_DEATH,
                     "device": str(device),
                     "torch_threads": torch.get_num_threads(),
-                    "resumed_from_step": steps_done,
+                    "resumed_from_step": resume_steps,
                 },
             )
         except Exception as e:
@@ -584,10 +597,10 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                     # written on a timer below, so a lucky random game that sets
                     # a high score early cannot cost you the good model.
                     agent.record = s
-                    agent.save(best_checkpoint, extra={"steps": steps_done})
+                    agent.save(best_checkpoint, extra={"steps": total_seen})
                     log.add("episode/best_score", s, episode_offset + agent.n_games + 1)
                     print(f"  [record] {s} at episode {episode_offset + agent.n_games + 1}, "
-                          f"step {steps_done:,}")
+                          f"step {steps_done:,} into this run")
                 agent.n_games += 1
                 agent.total_score += s
                 # Log every finished episode against its own episode counter, so
@@ -597,6 +610,7 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
 
             obs = next_obs
             steps_done += n_games
+            total_seen += n_games
 
             if steps_done >= next_train:
                 agent.train_on_replay()
@@ -624,9 +638,10 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
             # work. Records stop falling late in training, and without this the
             # only save points would be the rare new record.
             if now - last_save >= save_every:
-                agent.save(checkpoint, extra={"steps": steps_done})
+                agent.save(checkpoint, extra={"steps": total_seen})
                 last_save = now
-                print(f"  [saved] step {steps_done:,}, best {agent.record}")
+                print(f"  [saved] {steps_done:,} into this run "
+                      f"({total_seen:,} total), best {agent.record}")
 
             # Scalar block for the CURVES, on its own shorter cadence.
             #
@@ -642,7 +657,8 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                 recent_l = env.episode_lengths
 
                 log.add_many({
-                    "progress/steps": steps_done,
+                    "progress/steps": total_seen,
+                    "progress/run_steps": steps_done,
                     "progress/episodes": episode_offset + agent.n_games,
                     "progress/wall_clock_s": now - t0,
                     "throughput/steps_per_s": sps,
@@ -683,13 +699,13 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     except KeyboardInterrupt:
         interrupted = True
         print("\n=> Stopped by user. Saving before exit...")
-        agent.save(checkpoint, extra={"steps": steps_done})
+        agent.save(checkpoint, extra={"steps": total_seen})
         print(f"=> Saved {checkpoint}")
 
     elapsed = time.perf_counter() - t0
     # Always leave a current latest file behind, whether we finished the run or
     # the user stopped it.
-    agent.save(checkpoint, extra={"steps": steps_done})
+    agent.save(checkpoint, extra={"steps": total_seen})
 
     recent_r = env.episode_returns
     recent_s = env.episode_scores
@@ -697,7 +713,8 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     sps = steps_done / max(elapsed, 1e-9)
 
     log.add_many({
-        "progress/steps": steps_done,
+        "progress/steps": total_seen,
+        "progress/run_steps": steps_done,
         "progress/episodes": episode_offset + agent.n_games,
         "progress/wall_clock_s": elapsed,
         "throughput/steps_per_s": sps,
@@ -705,14 +722,14 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
         "episode/return_mean_200": float(np.mean(recent_r)) if recent_r else 0.0,
         "episode/score_mean_200": float(np.mean(recent_s)) if recent_s else 0.0,
         "episode/length_mean_200": float(np.mean(recent_l)) if recent_l else 0.0,
-    }, steps_done)
-    add_histogram(log, "episode/return_hist", list(recent_r), steps_done)
-    add_histogram(log, "episode/score_hist", list(recent_s), steps_done)
+    }, total_seen)
+    add_histogram(log, "episode/return_hist", list(recent_r), total_seen)
+    add_histogram(log, "episode/score_hist", list(recent_s), total_seen)
     log.close()
 
     print("-" * 72)
-    print(f"{'stopped' if interrupted else 'finished'} at {steps_done:,} steps "
-          f"in {elapsed:.1f}s")
+    print(f"{'stopped' if interrupted else 'finished'} after {steps_done:,} steps "
+          f"in this run, {total_seen:,} total, in {elapsed:.1f}s")
     print(f"  throughput     : {sps:,.0f} steps/s")
     print(f"  games finished : {agent.n_games}")
     print(f"  best score     : {agent.record}")
