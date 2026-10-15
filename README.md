@@ -7,14 +7,15 @@ hand rolled so every moving part stays readable.
 
 ## Which script is the good one
 
-Three iterations live side by side. They were written in order and each one
-supersedes the last.
+The files were written in order and each one supersedes the last. There is one
+addition that runs alongside rather than replacing anything, marked below.
 
 | Script | Written | Network | Optimizer | UI |
 |--------|---------|---------|-----------|-----|
 | `snake_ai_training.py` | Dec 3, 2025 | 11 to 256 to 3, single hidden layer | Adam, lr 0.001 | Single window, matplotlib live plot, fixed 40 fps |
 | `snake_ai_training2.py` | Dec 5, 2025 | 11 to 256 to 3, single hidden layer | Adam, lr 0.001 | Three panel dashboard, embedded Plotly chart, speed slider, scrollable history |
 | `snake_ai_training_Deep.py` | Dec 6, 2025 | 11 to 128 to 128 to 3, LayerNorm, no dropout | AdamW, lr 0.0005 | Same three panel dashboard as above |
+| `snake_ai_training_vec.py` | later addition | same network as the reference | same trainer as the reference | none, headless, many games at once |
 
 **`snake_ai_training_Deep.py` is the superior script and the one to run.** It is a
 strict superset of `snake_ai_training2.py`: everything that file does, it does
@@ -95,6 +96,66 @@ Not defects, just things a reader should know:
 - **Learning rate and size are choices, not proofs.** The reference net has not
   been benchmarked against the baseline in a controlled run.
 
+## Running many games at once
+
+`snake_ai_training_vec.py` trains the same network on many snakes in parallel,
+in one process, with one replay buffer.
+
+```
+python snake_ai_training_vec.py --games 64 --steps 500000
+```
+
+Measured on this machine, 64 parallel games, CPU:
+
+```
+finished 500,032 steps in 70.1s
+  throughput     : 7,129 steps/s
+  games finished : 1936
+  best score     : 62
+  avg return     : 242.45 (last 200 games)
+```
+
+Then the saved model, played greedily with no exploration in 30 fresh games:
+
+```
+mean 33.17, best 68, worst 5, 29 of 30 games scored 10 or more
+```
+
+For comparison, the single game script trains at about 923 steps per second,
+so this is roughly 8x the raw step rate. The bigger effect is that the whole
+500,000 step run finishes in about 70 seconds, which is what makes the score
+curve actually visible while you watch it.
+
+### Why it is faster, honestly
+
+Two separate effects, and it matters which is which:
+
+1. **Batched work.** One network call handles all 64 games. The vectorized
+   environment alone, with no training, runs about 1.4x faster than the single
+   game environment alone.
+2. **Less training per step.** The single game script trains on every single
+   step, one sample at a time. This script trains one replay batch of 1000
+   every `--train-every` steps. That is where most of the speed comes from, and
+   it is a real tradeoff, not free speed. Lower `--train-every` means more
+   learning per step and a slower loop. The default of 8 gives about 1.95
+   training samples per environment step, against 1.0 for the single game.
+
+Raising `--games` does not help past a point. The environment is Python and
+runs on one core, so 128 games measured barely faster than 64.
+
+### Running it on a GPU
+
+The batched design is what finally makes a GPU worthwhile, because the batch is
+always wide. A CUDA capable environment is needed:
+
+```
+python snake_ai_training_vec.py --games 256 --device cuda
+```
+
+Your conda `whisX`, `joycaption` and `pinclass` environments have CUDA torch
+that supports this card. None of them have `pygame`, which this script does not
+need at all, since it never opens a window.
+
 ## Requirements
 
 ```
@@ -156,7 +217,8 @@ regardless. Model weights are gitignored, so you will not find them in this repo
 ```
 snake_ai_training.py         original single window version
 snake_ai_training2.py        dashboard UI, baseline shallow network
-snake_ai_training_Deep.py    reference implementation
+snake_ai_training_Deep.py    reference implementation, one game at a time
+snake_ai_training_vec.py     many games at once, one network, no window
 model/                       checkpoint directory, contents gitignored
 requirements.txt             runtime dependencies
 .gitattributes               pins LF line endings across platforms
