@@ -467,6 +467,50 @@ The second experiment plays to what Laya is actually good at. Ask it to choose a
 random, and the chosen one is executed and measured. That separates "can this
 model play Snake" from "can this model usefully decide something about Snake".
 
+### The raw grid conv net, small boards, and what Path 2 showed
+
+`tools/run_path2.py` runs the learned-agent arms built from the external
+research on making an AI master Snake. The idea under test: a conv net over the
+raw grid should beat the hand coded 11 feature DQN, and a policy trained on a
+small board should transfer to a big one through global average pooling.
+
+```
+python tools/run_path2.py --list
+python tools/run_path2.py --only grid40-stepr,grid40-dist,grid40-both
+```
+
+Every arm runs 800,000 environment steps and every arm is scored greedily on
+the same 40x30 target board, which is what makes the curves comparable.
+
+| arm | trained on | train best | eval 40x30 mean | eval best |
+|-----|-----------|-----------|-----------------|-----------|
+| basic-refresh | 40x30, 11 features | 54 | **27.65** | **49** |
+| grid40 | 40x30, raw grid CNN | 3 | 0.00 | 0 |
+| grid10 | 10x10, raw grid CNN | 16 | 0.00 | 0 |
+| grid12 | 12x12, raw grid CNN | 11 | 0.05 | 1 |
+| curriculum12to40 | 12x12 then 40x30 | 6 | 0.05 | 1 |
+| grid40-stepr | 40x30, step penalty | 3 | 0.10 | 1 |
+| grid40-dist | 40x30, distance shaping | 26 | 2.90 | 9 |
+| grid40-both | 40x30, both | 24 | 3.50 | 9 |
+
+The full story, in one paragraph. The raw grid conv net learns to circle
+without eating on the big board: measured deaths are 12 of 12 by the starvation
+guard, with the food about 14 cells away on average, because a zero reward for
+doing nothing leaves no gradient towards the food. Training on 10x10 and 12x12
+works there, but the zero shot transfer to 40x30 scores 0, because after two
+max pools the receptive field covers about 11 by 11 cells and the global
+pooling carries no distance, so far food is invisible. A step penalty alone
+does not help. Distance shaping is the only fix that works, and it confirms the
+missing ingredient: those arms are the first CNN runs to eat on the big board,
+at eval mean 2.90 and 3.50. The 11 feature DQN still beats them eight to ten
+times over, because the four food direction bits hand over the food gradient
+for free. The external finding that a conv net beats hand features does not
+transfer to a 40x30 board with sparse plus/minus 10 rewards, and the reason is
+now measured, not guessed.
+
+The planning result remains the strongest number in the repo: `policy_bfs_safe`
+in `tools/search_baseline.py` scores mean 132 with no learning at all.
+
 ## Requirements
 
 ```
