@@ -178,6 +178,62 @@ class Linear_QNet(nn.Module):
         return self.l4(x)
 
 
+class GridQNet(nn.Module):
+    """Small conv net over the raw board, with global average pooling.
+
+    Why this exists, stated plainly: the 11 feature state caps every learned
+    agent at a mean of about 28 to 36, proven twice, once by 39 million DQN
+    steps and once by imitation, where a student copied a teacher that scores
+    132 and still only reached 28. The information needed to avoid traps is not
+    in those 11 numbers.
+
+    This network instead reads the whole board as channels: body, head, food,
+    and the cell straight ahead. The global pooling makes the same weights read
+    ANY board size, which is the whole point of the curriculum arms: train on
+    10x10, play on 40x30, one set of weights, no retraining.
+
+    Sized so it runs at useful speed on CPU: about 17k parameters, roughly the
+    same as the old MLP. MaxPool(2) twice keeps the 40x30 board cheap; the
+    smallest supported board is 8x8, where pooling leaves a 2x2 map for the
+    global average to read.
+    """
+
+    def __init__(self, in_channels=4, output_size=3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.output_size = output_size
+        self.conv1 = nn.Conv2d(in_channels, 16, 3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.conv3 = nn.Conv2d(32, 32, 3, padding=1)
+        self.pool = nn.MaxPool2d(2)
+        self.head = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_size),
+        )
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = F.relu(self.conv3(x))
+        # Global average pooling. This is what makes the network blind to board
+        # size, which is what makes the curriculum transfer possible.
+        x = x.mean(dim=(2, 3))
+        return self.head(x)
+
+
+def build_model(obs_mode, obs_width=None, output_size=3, use_norm=True,
+                hidden_size=HIDDEN_SIZE, hidden_layers=HIDDEN_LAYERS):
+    """One network factory for both trainers, so the width and the kind can
+    never disagree with the environment that feeds them."""
+    if obs_mode == "grid":
+        return GridQNet(in_channels=4, output_size=output_size)
+    return Linear_QNet(obs_width, hidden_size, output_size,
+                       hidden_layers=hidden_layers, use_norm=use_norm)
+
+
 class QTrainer:
     """Trains the Q network.
 
@@ -342,6 +398,18 @@ def architecture_fingerprint(input_size=11, output_size=3, use_norm=True):
         # Recorded because a checkpoint from a norm net cannot load into a
         # no-norm net, and the mismatch should be reported rather than crash.
         "use_norm": bool(use_norm),
+    }
+
+
+def grid_architecture_fingerprint(in_channels=4, output_size=3):
+    """Shape of a grid reading network, stored in the checkpoint and checked on
+    load. Board size is deliberately NOT part of it: the global pooling makes
+    the same weights legal on every board, which is the point of the curriculum
+    arms."""
+    return {
+        "kind": "grid",
+        "in_channels": in_channels,
+        "output_size": output_size,
     }
 
 

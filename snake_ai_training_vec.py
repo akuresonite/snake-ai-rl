@@ -58,6 +58,8 @@ from snake_core import (  # noqa: E402
     Linear_QNet,
     QTrainer,
     architecture_fingerprint,
+    build_model,
+    grid_architecture_fingerprint,
     set_threads,
     torch_load_checkpoint,
 )
@@ -131,9 +133,13 @@ class Board:
 
     __slots__ = ("cols", "rows", "game_w", "game_h")
 
-    def __init__(self, w=800, h=600, block=BLOCK_SIZE):
-        self.cols = w // block
-        self.rows = h // block
+    def __init__(self, w=800, h=600, block=BLOCK_SIZE, cols=None, rows=None):
+        if cols and rows:
+            self.cols = int(cols)
+            self.rows = int(rows)
+        else:
+            self.cols = w // block
+            self.rows = h // block
         self.game_w = self.cols * block
         self.game_h = self.rows * block
 
@@ -165,18 +171,39 @@ class VecSnake:
                Measured, frames per food rises only slightly with score while
                self collisions stay at almost every death, so the agent is
                sealing itself in rather than running out of time.
+      "grid"   4 channels of the whole board: body, head, food, and the cell
+               straight ahead. Read by a small conv net with global pooling,
+               so one set of weights reads any board size. This is the fix for
+               the information wall the flat features hit, and the size
+               transfer is the curriculum experiment.
     """
 
     WIDTHS = {"basic": 11, "rich": 21, "flood": 25}
 
-    def __init__(self, n_games, w=800, h=600, auto_reset=True, obs_mode="basic"):
-        if obs_mode not in self.WIDTHS:
-            raise ValueError(f"obs_mode must be one of {sorted(self.WIDTHS)}")
+    def __init__(self, n_games, w=800, h=600, auto_reset=True, obs_mode="basic",
+                 cols=None, rows=None, step_reward=0.0, distance_reward=0.0):
+        if obs_mode not in ("basic", "rich", "flood", "grid"):
+            raise ValueError(f"obs_mode must be one of basic, rich, flood, grid")
         self.n = n_games
         self.obs_mode = obs_mode
-        self.obs_width = self.WIDTHS[obs_mode]
-        self.board = Board(w, h)
+        self.obs_width = self.WIDTHS.get(obs_mode)
+        self.board = Board(w, h, cols=cols, rows=rows)
         self.auto_reset = auto_reset
+        # A small penalty on steps that are not eating. This is the fix for the
+        # circling loophole: with a 0 reward for doing nothing, Q(circle) stays 0
+        # forever and the food signal never propagates, so a conv net on a big
+        # board learns to circle until the starvation guard kills it. Measured:
+        # 12 of 12 deaths by starvation, food about 14 cells away. A negative
+        # step reward makes circling strictly worse than eating, so the value
+        # gradient towards the food finally exists.
+        self.step_reward = float(step_reward)
+        # Distance shaping: reward for moving closer to the food, penalty for
+        # moving away. The flat 11 feature state hands the DQN the food
+        # direction for free, which is why it learns to eat quickly. A conv net
+        # must discover the food direction itself, and on a 40x30 board the food
+        # is usually outside its receptive field, so the gradient has to come
+        # from the reward instead. This is the standard snake tutorial trick.
+        self.distance_reward = float(distance_reward)
         self.steps = 0
         self.episodes = 0
         self.episode_returns = deque(maxlen=200)
@@ -184,6 +211,15 @@ class VecSnake:
         self.episode_lengths = deque(maxlen=200)
         self.episode_best = 0
         self._returns = np.zeros(n_games, dtype=np.float32)
+
+        # The raw board, kept incrementally so it costs one cell write per
+        # change instead of a rebuild per step. observe() returns a copy,
+        # because the replay buffer must keep the state as it was and the grid
+        # keeps changing under it.
+        if obs_mode == "grid":
+            self.grids = np.zeros((n_games, 4, self.board.rows, self.board.cols),
+                                  dtype=np.uint8)
+            self.ahead_cells = np.zeros((n_games, 2), dtype=np.int32)
 
         # Scratch space for the flood fill, allocated once. Reusing these is what
         # makes the flood state usable at all: a set based version ran the loop
@@ -229,6 +265,45 @@ class VecSnake:
         self._returns[idx] = 0.0
         fx, fy = self._place_food(idx)
         self.foods[idx] = (fx, fy)
+        if self.obs_mode == "grid":
+            self._build_grid(idx)
+
+    def _build_grid(self, idx):
+        """Rebuild the 4 channel board for one game. Called on reset only, the
+        step loop updates cells in place."""
+        g = self.grids[idx]
+        g.fill(0)
+        cols, rows = self.board.cols, self.board.rows
+        for x, y in self.bodies[idx]:
+            gx, gy = x // BLOCK_SIZE, y // BLOCK_SIZE
+            if 0 <= gx < cols and 0 <= gy < rows:
+                g[0, gy, gx] = 1
+        hx, hy = int(self.heads[idx, 0]) // BLOCK_SIZE, int(self.heads[idx, 1]) // BLOCK_SIZE
+        g[1, hy, hx] = 1
+        fx, fy = int(self.foods[idx, 0]) // BLOCK_SIZE, int(self.foods[idx, 1]) // BLOCK_SIZE
+        if 0 <= fx < cols and 0 <= fy < rows:
+            g[2, fy, fx] = 1
+        ax, ay = self._straight_cell(idx)
+        if 0 <= ax < cols and 0 <= ay < rows:
+            g[3, ay, ax] = 1
+        self.ahead_cells[idx] = (ax, ay)
+
+    def _straight_cell(self, idx):
+        """The cell the snake enters on action straight. Channel 3 of the grid.
+
+        This channel is what makes the three RELATIVE actions readable from an
+        absolute board: the conv net sees which cell is ahead, and learns that
+        action 0 goes there, action 1 right of the heading, action 2 left.
+        """
+        hx, hy = int(self.heads[idx, 0]), int(self.heads[idx, 1])
+        d = self.directions[idx]
+        if d == Direction.RIGHT.value:
+            return hx // BLOCK_SIZE + 1, hy // BLOCK_SIZE
+        if d == Direction.LEFT.value:
+            return hx // BLOCK_SIZE - 1, hy // BLOCK_SIZE
+        if d == Direction.DOWN.value:
+            return hx // BLOCK_SIZE, hy // BLOCK_SIZE + 1
+        return hx // BLOCK_SIZE, hy // BLOCK_SIZE - 1
 
     def reset(self):
         self.heads = np.zeros((self.n, 2), dtype=np.int32)
@@ -244,14 +319,16 @@ class VecSnake:
 
     # ---- observation ------------------------------------------------------
     def observe(self):
-        """Stack the state vector for every game. Returns (n, obs_width) int8.
+        """The state for every game, shaped by obs_mode.
 
-        Every feature is scaled to a comparable range. The wall distances are
-        divided down, because a raw distance of up to 39 next to ten features
-        that are only 0 or 1 hands the network one input with about forty times
-        the range of the others, which makes training harder rather than easier.
+        Flat modes return (n, obs_width) int8. Grid mode returns
+        (n, 4, rows, cols) uint8 and the copy matters: the grids are updated in
+        place by step(), so handing out the live array would corrupt every
+        sample the replay buffer is holding.
         """
         n = self.n
+        if self.obs_mode == "grid":
+            return self.grids.copy()
         if self.obs_mode == "basic":
             return self._observe_basic(n)
         if self.obs_mode == "rich":
@@ -579,7 +656,8 @@ class VecSnake:
         scores = self.scores.copy()
 
         for i in range(n):
-            hx, hy = int(self.heads[i, 0]), int(self.heads[i, 1])
+            old_hx, old_hy = int(self.heads[i, 0]), int(self.heads[i, 1])
+            hx, hy = old_hx, old_hy
             d = self.directions[i]
             a = int(actions[i])
 
@@ -639,6 +717,24 @@ class VecSnake:
             else:
                 tail = self.queues[i].pop()
                 body.discard(tail)
+                # The neutral step penalty. See step_reward on __init__.
+                rewards[i] += self.step_reward
+                # Distance shaping towards the food, only on non eating steps.
+                # The eaten cell moved the food, so shaping against the old food
+                # position would be noise. In cells, so the scale is the same on
+                # every board size.
+                if self.distance_reward:
+                    old_d = abs(fx - old_hx) + abs(fy - old_hy)
+                    new_d = abs(fx - hx) + abs(fy - hy)
+                    rewards[i] += (old_d - new_d) // BLOCK_SIZE * self.distance_reward
+                if self.obs_mode == "grid":
+                    # The tail cell is empty again, one write, no rebuild.
+                    tx, ty = tail[0] // BLOCK_SIZE, tail[1] // BLOCK_SIZE
+                    if 0 <= tx < self.board.cols and 0 <= ty < self.board.rows:
+                        self.grids[i, 0, ty, tx] = 0
+
+            if self.obs_mode == "grid":
+                self._grid_step(i, old_hx, old_hy, fx, fy)
 
         self._returns += rewards
         if self.auto_reset:
@@ -656,6 +752,39 @@ class VecSnake:
         if score > self.episode_best:
             self.episode_best = int(score)
 
+    # ---- grid bookkeeping -------------------------------------------------
+    def _grid_step(self, idx, old_hx, old_hy, eaten_fx, eaten_fy):
+        """The few cell writes one step costs, so the grid never needs a
+        rebuild. Body cells are handled by the caller, this covers the head,
+        the ahead marker and the food."""
+        cols, rows = self.board.cols, self.board.rows
+        g = self.grids[idx]
+        hx, hy = int(self.heads[idx, 0]) // BLOCK_SIZE, int(self.heads[idx, 1]) // BLOCK_SIZE
+        ogx, ogy = old_hx // BLOCK_SIZE, old_hy // BLOCK_SIZE
+
+        if 0 <= ogx < cols and 0 <= ogy < rows:
+            g[1, ogy, ogx] = 0
+        if 0 <= hx < cols and 0 <= hy < rows:
+            g[0, hy, hx] = 1    # the new head joins the body channel
+            g[1, hy, hx] = 1
+
+        ax, ay = int(self.ahead_cells[idx, 0]), int(self.ahead_cells[idx, 1])
+        if 0 <= ax < cols and 0 <= ay < rows:
+            g[3, ay, ax] = 0
+        nax, nay = self._straight_cell(idx)
+        if 0 <= nax < cols and 0 <= nay < rows:
+            g[3, nay, nax] = 1
+        self.ahead_cells[idx] = (nax, nay)
+
+        # The caller already moved the food, so mirror what foods[] says. The
+        # eaten cell is no longer food, the new one is.
+        efx, efy = eaten_fx // BLOCK_SIZE, eaten_fy // BLOCK_SIZE
+        if 0 <= efx < cols and 0 <= efy < rows:
+            g[2, efy, efx] = 0
+        fx, fy = int(self.foods[idx, 0]) // BLOCK_SIZE, int(self.foods[idx, 1]) // BLOCK_SIZE
+        if 0 <= fx < cols and 0 <= fy < rows:
+            g[2, fy, fx] = 1
+
 
 # ==========================================
 # PART 2: AGENT (shared network and replay)
@@ -664,21 +793,16 @@ class VecSnake:
 class VecAgent:
     """One network, one replay buffer, N games feeding it."""
 
-    def __init__(self, device, use_norm=True):
+    def __init__(self, device, use_norm=True, obs_mode="basic", max_memory=MAX_MEMORY):
         self.device = device
         self.n_games = 0
-        self.memory = deque(maxlen=MAX_MEMORY)
+        self.memory = deque(maxlen=max_memory)
         self.use_norm = use_norm
+        self.obs_mode = obs_mode
         # Set from the environment by train(), so the network width and the
         # observation width can never disagree.
-        self.obs_width = VecSnake.WIDTHS["basic"]
-        self.model = Linear_QNet(
-            input_size=self.obs_width,
-            hidden_size=HIDDEN_SIZE,
-            output_size=3,
-            hidden_layers=HIDDEN_LAYERS,
-            use_norm=use_norm,
-        ).to(device)
+        self.obs_width = VecSnake.WIDTHS.get(obs_mode, VecSnake.WIDTHS["basic"])
+        self.model = build_model(obs_mode, self.obs_width, use_norm=use_norm).to(device)
         self.trainer = QTrainer(self.model, lr=LR, gamma=GAMMA)
         self.record = 0
         self.total_score = 0
@@ -687,6 +811,8 @@ class VecAgent:
     def architecture(self):
         # Shared with the single game script, so a checkpoint written by either
         # one is recognised by the other.
+        if self.obs_mode == "grid":
+            return grid_architecture_fingerprint()
         return architecture_fingerprint(input_size=self.obs_width,
                                         use_norm=getattr(self, "use_norm", True))
 
@@ -825,12 +951,58 @@ def resolve_device(name):
     return torch.device(name)
 
 
+def _parse_board(spec):
+    """'40x30' becomes (40, 30). Keeps the CLI on one flag."""
+    if spec is None:
+        return None
+    if isinstance(spec, (tuple, list)):
+        return int(spec[0]), int(spec[1])
+    cols, rows = spec.lower().split("x")
+    return int(cols), int(rows)
+
+
+def greedy_eval(agent, obs_mode, board, games=20, seed=4242, step_reward=0.0,
+                distance_reward=0.0):
+    """Score the current weights on a fresh board, greedily, no exploration.
+
+    Every arm uses this with the SAME target board, so the numbers are
+    comparable even when one arm trained on 10x10 and another on 40x30. That is
+    the whole point: training scores on different boards are not comparable,
+    these are. The reward shaping must match the training run, because it is
+    part of the MDP the Q values were learned for.
+    """
+    cols, rows = board
+    env = VecSnake(games, obs_mode=obs_mode, cols=cols, rows=rows,
+                   step_reward=step_reward, distance_reward=distance_reward)
+    np.random.seed(seed)
+    obs = env.observe()
+    scores = []
+    was_training = agent.model.training
+    agent.model.eval()
+    try:
+        while len(scores) < games:
+            with torch.no_grad():
+                x = torch.as_tensor(obs, dtype=torch.float32, device=agent.device)
+                q = agent.model(x)
+            a = q.argmax(dim=1).cpu().numpy()
+            obs, _r, done, sc = env.step(a)
+            for i in np.flatnonzero(done):
+                scores.append(int(sc[i]))
+    finally:
+        if was_training:
+            agent.model.train()
+    return scores
+
+
 def train(n_games, total_steps, train_every, device_name, checkpoint,
           best_checkpoint=VEC_BEST_CHECKPOINT, save_every=60.0, quiet=False,
           log_backend="both", run_name=None, log_dir="./runs", report_every=5.0,
           log_every=1.0, obs_mode="basic", use_norm=True,
           target_net=False, double_dqn=False, n_step=1, tau=0.01,
-          patience=0, min_train_calls=200, log_group=None):
+          patience=0, min_train_calls=200, log_group=None,
+          board=None, max_memory=None,
+          eval_target=None, eval_every=0, eval_games=20,
+          step_reward=0.0, distance_reward=0.0):
     """Train the vectorized agent.
 
     Two checkpoint files are kept on purpose:
@@ -875,24 +1047,33 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
         )
         print(f"=> run name: {run_name}")
 
-    env = VecSnake(n_games, obs_mode=obs_mode)
-    agent = VecAgent(device, use_norm=use_norm)
+    board_dims = _parse_board(board)
+    env = VecSnake(n_games, obs_mode=obs_mode,
+                   cols=board_dims[0] if board_dims else None,
+                   rows=board_dims[1] if board_dims else None,
+                   step_reward=step_reward, distance_reward=distance_reward)
+    agent = VecAgent(device, use_norm=use_norm, obs_mode=obs_mode,
+                     max_memory=max_memory or MAX_MEMORY)
     # The network width comes from the environment. If these two ever disagree,
     # the replay samples and the model cannot be multiplied and training raises.
     agent.obs_width = env.obs_width
-    agent.model = Linear_QNet(
-        input_size=env.obs_width,
-        hidden_size=HIDDEN_SIZE,
-        output_size=3,
-        hidden_layers=HIDDEN_LAYERS,
-        use_norm=use_norm,
-    ).to(device)
+    agent.model = build_model(obs_mode, env.obs_width, use_norm=use_norm).to(device)
     agent.trainer = QTrainer(agent.model, lr=LR, gamma=GAMMA,
                              target=target_net, double_dqn=double_dqn,
                              n_step=n_step, tau=tau)
-    print(f"=> state vector: {obs_mode}, {env.obs_width} features, "
-          f"LayerNorm {'on' if use_norm else 'OFF'}")
+    if obs_mode == "grid":
+        print(f"=> state: {obs_mode}, 4 channel board {env.board.cols}x{env.board.rows}, "
+              f"conv net with global pooling (same weights on any board size)")
+    else:
+        print(f"=> state vector: {obs_mode}, {env.obs_width} features, "
+              f"LayerNorm {'on' if use_norm else 'OFF'}")
     print(f"=> trainer: {agent.trainer.describe()}")
+    print(f"=> training board: {env.board.cols}x{env.board.rows} "
+          f"({env.board.cell_count()} cells), replay cap {agent.memory.maxlen:,}")
+    eval_target_dims = _parse_board(eval_target) if eval_target else None
+    if eval_target_dims:
+        print(f"=> eval target: {eval_target_dims[0]}x{eval_target_dims[1]}, "
+              f"{eval_games} greedy games every {eval_every:,} steps")
     if patience:
         print(f"=> early stop: no improvement for {patience} training calls "
               f"(after at least {min_train_calls})")
@@ -950,6 +1131,7 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                     "train_every": train_every,
                     "obs_mode": obs_mode,
                     "obs_width": env.obs_width,
+                    "train_board": f"{env.board.cols}x{env.board.rows}",
                     "use_norm": use_norm,
                     "hidden_size": HIDDEN_SIZE,
                     "hidden_layers": HIDDEN_LAYERS,
@@ -964,6 +1146,11 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
                     "device": str(device),
                     "torch_threads": torch.get_num_threads(),
                     "resumed_from_step": resume_steps,
+                    "max_memory": agent.memory.maxlen,
+                    "step_reward": step_reward,
+                    "distance_reward": distance_reward,
+                    "eval_target": (f"{eval_target_dims[0]}x{eval_target_dims[1]}"
+                                    if eval_target_dims else None),
                 },
             )
         except Exception as e:
@@ -980,6 +1167,7 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
     last_report = t0
     last_log = t0
     last_save = t0
+    last_eval = 0
     report_step = steps_done
     log_step = steps_done
     train_calls = 0
@@ -1075,6 +1263,27 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
             obs = next_obs
             steps_done += n_games
             total_seen += n_games
+
+            # Periodic greedy evaluation on the TARGET board. This is the fair
+            # comparison across arms: a run trained on 10x10 and one trained on
+            # 40x30 both get scored here on the same 40x30 board, so the curves
+            # can be overlaid without lying about what they mean.
+            if eval_target_dims and eval_every and steps_done - last_eval >= eval_every:
+                last_eval = steps_done
+                t_ev = time.perf_counter()
+                ev_scores = greedy_eval(agent, obs_mode, eval_target_dims,
+                                        games=eval_games,
+                                        step_reward=step_reward,
+                                        distance_reward=distance_reward)
+                log.add_many({
+                    "eval/score_mean": float(np.mean(ev_scores)),
+                    "eval/score_best": float(max(ev_scores)),
+                    "eval/score_min": float(min(ev_scores)),
+                    "eval/wall_clock_s": time.perf_counter() - t_ev,
+                }, total_seen)
+                print(f"  [eval {eval_target_dims[0]}x{eval_target_dims[1]}] "
+                      f"mean {np.mean(ev_scores):.2f} best {max(ev_scores)} "
+                      f"({eval_games} games, step {total_seen:,})")
 
             if steps_done >= next_train:
                 agent.train_on_replay()
@@ -1216,6 +1425,22 @@ def train(n_games, total_steps, train_every, device_name, checkpoint,
         "episode/score_mean_200": float(np.mean(recent_s)) if recent_s else 0.0,
         "episode/length_mean_200": float(np.mean(recent_l)) if recent_l else 0.0,
     }, total_seen)
+    # The final eval on the target board, so every run ends with the number the
+    # comparison is actually about, whatever board it trained on.
+    if eval_target_dims:
+        print(f"=> final eval on {eval_target_dims[0]}x{eval_target_dims[1]}...")
+        ev_scores = greedy_eval(agent, obs_mode, eval_target_dims, games=eval_games,
+                                step_reward=step_reward,
+                                distance_reward=distance_reward)
+        log.add_many({
+            "eval/final_mean": float(np.mean(ev_scores)),
+            "eval/final_best": float(max(ev_scores)),
+            "eval/final_min": float(min(ev_scores)),
+        }, total_seen)
+        print(f"=> final eval: mean {np.mean(ev_scores):.2f}, "
+              f"best {max(ev_scores)}, min {min(ev_scores)} "
+              f"({len(ev_scores)} games)")
+
     add_histogram(log, "episode/return_hist", list(recent_r), total_seen)
     add_histogram(log, "episode/score_hist", list(recent_s), total_seen)
     log.close()
@@ -1262,9 +1487,31 @@ def main():
     p.add_argument("--log-every", type=float, default=1.0,
                    help="seconds between logged points on the curves (default 1)")
     p.add_argument("--state", dest="obs_mode", default="basic",
-                   choices=sorted(VecSnake.WIDTHS),
-                   help="what the agent can see: basic 11 features, or rich 21 "
-                        "with wall distance, tail distance and snake length")
+                   choices=["basic", "rich", "flood", "grid"],
+                   help="what the agent can see: basic 11 features, rich 21, "
+                        "flood 25 trap features, or grid, the raw 4 channel "
+                        "board read by a conv net that works on any board size")
+    p.add_argument("--board", default=None,
+                   help="training board in cells, e.g. 40x30 or 12x12 "
+                        "(default 40x30)")
+    p.add_argument("--max-memory", type=int, default=None,
+                   help="replay cap. Default 100000, but a grid state on 40x30 "
+                        "is 4800 bytes per sample, so large boards need less")
+    p.add_argument("--eval-target", default=None,
+                   help="board to score greedy games on, e.g. 40x30. This is "
+                        "the fair cross arm comparison")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="steps between target board evals. 0 means only at the end")
+    p.add_argument("--eval-games", type=int, default=20,
+                   help="greedy games per eval")
+    p.add_argument("--step-reward", type=float, default=0.0,
+                   help="reward on steps that do not eat. Negative values "
+                        "penalise circling, which is the fix for the conv net "
+                        "learning to loop until the starvation guard kills it")
+    p.add_argument("--distance-reward", type=float, default=0.0,
+                   help="shaping: reward for moving closer to the food, penalty "
+                        "for moving away, per cell. Gives the conv net the food "
+                        "gradient that the 11 features hand to the DQN for free")
     p.add_argument("--no-norm", dest="use_norm", action="store_false",
                    help="drop LayerNorm from the hidden layers. Tested: does not help")
     p.set_defaults(use_norm=True)
@@ -1293,7 +1540,11 @@ def main():
           a.best_checkpoint, a.save_every, a.quiet, a.log_backend,
           a.run_name, a.log_dir, a.report_every, a.log_every, a.obs_mode,
           a.use_norm, a.target_net, a.double_dqn, a.n_step, a.tau,
-          a.patience, a.min_train_calls, a.log_group)
+          a.patience, a.min_train_calls, a.log_group,
+          board=a.board, max_memory=a.max_memory,
+          eval_target=a.eval_target, eval_every=a.eval_every,
+          eval_games=a.eval_games, step_reward=a.step_reward,
+          distance_reward=a.distance_reward)
 
 
 if __name__ == "__main__":
