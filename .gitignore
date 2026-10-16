@@ -12,6 +12,9 @@ ENV/
 # PyTorch / training artifacts
 *.pt
 *.pth
+*.pkl
+*.npy
+*.npz
 checkpoints/
 runs/
 logs/

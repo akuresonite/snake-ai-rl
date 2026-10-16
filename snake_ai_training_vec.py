@@ -417,7 +417,15 @@ class VecSnake:
         return (x, y)
 
     def _observe_flood(self, n):
-        """Basic 11, then the flood fill numbers scaled to 0..9."""
+        """Basic 11, then the flood fill numbers scaled to 0..9.
+
+        Cost note: trap_stats calls flood fill up to four times per game, so
+        this is about 40 observations per second for a single game and about
+        152 steps per second for a training loop, against 94,610 for the basic
+        state. It is usable for recording a teacher or for analysis with a
+        handful of games, and NOT usable for a training sweep at full stride.
+        Use --obs-stride in tools/ml_imitation.py to sample instead.
+        """
         out = np.zeros((n, 25), dtype=np.int8)
         out[:, :11] = self._observe_basic(n)
         for i in range(n):
@@ -441,6 +449,17 @@ class VecSnake:
             out[i, 23] = 9 - min(9, int(st["free_ratio"] * 10))
             out[i, 24] = 1 if st["legal_moves"] <= 1 else 0
         return out
+
+    def observe_flood_fast(self):
+        """Deprecated. Slower than observe(), kept only as a warning.
+
+        Measured 36 observations per second against 75 for observe(), because it
+        calls observe() internally and that already runs trap_stats. The lesson:
+        the cost is the flood fill itself, not the array handling around it, so
+        micro optimising the wrapper cannot help. Use observation striding
+        instead, which cuts how OFTEN the flood runs rather than how fast it is.
+        """
+        return self.observe()
 
     def _observe_basic(self, n):
         out = np.zeros((n, 11), dtype=np.int8)
