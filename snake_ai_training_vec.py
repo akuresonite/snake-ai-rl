@@ -157,12 +157,17 @@ class VecSnake:
     to the code that fills it makes that mistake impossible.
 
       "basic"  11 features. The original. One cell of lookahead.
-      "rich"   21 features. Adds wall distance, distance to the tail, and the
-               length of the snake, so the agent can tell a short snake in open
-               space from a long one that is running out of room.
+      "rich"   21 features. Wall distance, distance to the tail, length, and
+               the distance to the food.
+      "flood"  25 features. Everything in basic, plus the flood fill numbers.
+               These are the ones about being trapped, which matters because
+               95 to 100 percent of deaths are the snake running into itself.
+               Measured, frames per food rises only slightly with score while
+               self collisions stay at almost every death, so the agent is
+               sealing itself in rather than running out of time.
     """
 
-    WIDTHS = {"basic": 11, "rich": 21}
+    WIDTHS = {"basic": 11, "rich": 21, "flood": 25}
 
     def __init__(self, n_games, w=800, h=600, auto_reset=True, obs_mode="basic"):
         if obs_mode not in self.WIDTHS:
@@ -179,6 +184,15 @@ class VecSnake:
         self.episode_lengths = deque(maxlen=200)
         self.episode_best = 0
         self._returns = np.zeros(n_games, dtype=np.float32)
+
+        # Scratch space for the flood fill, allocated once. Reusing these is what
+        # makes the flood state usable at all: a set based version ran the loop
+        # at 71 steps per second against 19,000 for the basic state.
+        cells = self.board.cols * self.board.rows
+        self._occ = np.zeros(cells, dtype=bool)
+        self._seen = np.zeros(cells, dtype=bool)
+        self._stack = np.zeros(cells, dtype=np.int32)
+
         self.reset()
 
     # ---- helpers ----------------------------------------------------------
@@ -233,15 +247,200 @@ class VecSnake:
         """Stack the state vector for every game. Returns (n, obs_width) int8.
 
         Every feature is scaled to a comparable range. The wall distances are
-        divided down to 0..4, because a raw distance of up to 39 next to ten
-        features that are only 0 or 1 hands the network one input with about
-        forty times the range of the others, which makes training harder rather
-        than easier.
+        divided down, because a raw distance of up to 39 next to ten features
+        that are only 0 or 1 hands the network one input with about forty times
+        the range of the others, which makes training harder rather than easier.
         """
         n = self.n
         if self.obs_mode == "basic":
             return self._observe_basic(n)
-        return self._observe_rich(n)
+        if self.obs_mode == "rich":
+            return self._observe_rich(n)
+        return self._observe_flood(n)
+
+    # ---- flood fill, the trap measurement --------------------------------
+    #
+    # Performance matters here. A set of tuples costs roughly 12 microseconds
+    # per call, and trap_stats calls it up to four times per game per step, so
+    # with 256 games that is milliseconds per environment step. Measured, the
+    # set version ran the loop at 71 steps per second against 19,000 for the
+    # basic state, which makes it unusable.
+    #
+    # This version uses flat numpy arrays and a preallocated stack. No sets, no
+    # tuples, no allocation per call.
+    def _fill_occupancy(self, body, head, tail):
+        """Mark body cells, minus the head and the tail, as blocked."""
+        self._occ.fill(False)
+        for x, y in body:
+            self._occ[(y // BLOCK_SIZE) * self.board.cols + (x // BLOCK_SIZE)] = True
+        # The head is where the snake already is, not a wall. Leaving it blocked
+        # made the area from the head come out as 0, which turned every trap
+        # feature into a constant.
+        self._occ[(head[1] // BLOCK_SIZE) * self.board.cols + (head[0] // BLOCK_SIZE)] = False
+        if tail is not None:
+            self._occ[(tail[1] // BLOCK_SIZE) * self.board.cols + (tail[0] // BLOCK_SIZE)] = False
+
+    def flood_area_grid(self, start_gx, start_gy):
+        """Count reachable cells from a grid cell, using the occupancy grid."""
+        cols, rows = self.board.cols, self.board.rows
+        if start_gx < 0 or start_gy < 0 or start_gx >= cols or start_gy >= rows:
+            return 0
+        start = start_gy * cols + start_gx
+        if self._occ[start]:
+            return 0
+        seen = self._seen
+        seen.fill(False)
+        seen[start] = True
+        stack = self._stack
+        top = 0
+        stack[0] = start
+        top = 1
+        area = 0
+        while top:
+            top -= 1
+            cur = stack[top]
+            area += 1
+            cx = cur % cols
+            cy = cur // cols
+            if cx > 0:
+                n = cur - 1
+                if not seen[n] and not self._occ[n]:
+                    seen[n] = True
+                    stack[top] = n
+                    top += 1
+            if cx < cols - 1:
+                n = cur + 1
+                if not seen[n] and not self._occ[n]:
+                    seen[n] = True
+                    stack[top] = n
+                    top += 1
+            if cy > 0:
+                n = cur - cols
+                if not seen[n] and not self._occ[n]:
+                    seen[n] = True
+                    stack[top] = n
+                    top += 1
+            if cy < rows - 1:
+                n = cur + cols
+                if not seen[n] and not self._occ[n]:
+                    seen[n] = True
+                    stack[top] = n
+                    top += 1
+        return area
+
+    def _tail_reachable_grid(self, tail_g):
+        return self._seen[tail_g[1] * self.board.cols + tail_g[0]]
+
+    def trap_stats(self, idx):
+        """Everything needed to describe whether a snake is trapping itself."""
+        queues = self.queues[idx]
+        body = self.bodies[idx]
+        hx, hy = int(self.heads[idx, 0]), int(self.heads[idx, 1])
+        head = (hx, hy)
+        tail = queues[-1] if len(queues) > 1 else None
+        self._fill_occupancy(body, head, tail)
+
+        cells = self.board.cols * self.board.rows
+        gx, gy = hx // BLOCK_SIZE, hy // BLOCK_SIZE
+        area_from_head = self.flood_area_grid(gx, gy)
+        # The reachable set from the head is now in self._seen, so the tail check
+        # is free rather than a second search.
+        tail_reachable = True
+        if tail is not None:
+            tail_reachable = self._tail_reachable_grid(
+                (tail[0] // BLOCK_SIZE, tail[1] // BLOCK_SIZE))
+
+        danger, _named = self.collision_detail(idx)
+        legal = [m for m in ("straight", "right", "left") if not danger[m]]
+        best_move_area = 0
+        per_move = {}
+        for m in legal:
+            cx, cy = self.ray_cell(head, self.directions[idx], m)
+            # flood_area_grid overwrites self._seen, so the tail check above has
+            # to happen first. It does.
+            per_move[m] = self.flood_area_grid(cx // BLOCK_SIZE, cy // BLOCK_SIZE)
+            best_move_area = max(best_move_area, per_move[m])
+
+        body_cells = max(1, len(body) - (1 if tail is not None else 0) - 1)
+        free_cells = cells - body_cells
+        return {
+            "reachable_from_head": area_from_head,
+            "best_move_area": best_move_area,
+            "per_move_area": per_move,
+            "legal_moves": len(legal),
+            "trap_ratio": area_from_head / cells,
+            "free_ratio": free_cells / cells,
+            "tail_reachable": tail_reachable,
+            "cells": cells,
+            "body": body_cells,
+            "free": free_cells,
+        }
+
+    def collision_detail(self, idx):
+        """Danger per move name, and the cell each move would enter."""
+        head = (int(self.heads[idx, 0]), int(self.heads[idx, 1]))
+        d = self.directions[idx]
+        clock = (Direction.RIGHT.value, Direction.DOWN.value,
+                 Direction.LEFT.value, Direction.UP.value)
+        i = clock.index(d)
+        named = {
+            "straight": clock[i],
+            "right": clock[(i + 1) % 4],
+            "left": clock[(i - 1) % 4],
+        }
+        out = {}
+        for name, nd in named.items():
+            cell = self.ray_cell(head, d, name)
+            out[name] = self._is_collision(idx, *cell)
+        return out, named
+
+    @staticmethod
+    def ray_cell(head, d, move):
+        clock = (Direction.RIGHT.value, Direction.DOWN.value,
+                 Direction.LEFT.value, Direction.UP.value)
+        i = clock.index(d)
+        if move == "straight":
+            nd = clock[i]
+        elif move == "right":
+            nd = clock[(i + 1) % 4]
+        else:
+            nd = clock[(i - 1) % 4]
+        x, y = head
+        if nd == Direction.RIGHT.value:
+            x += BLOCK_SIZE
+        elif nd == Direction.LEFT.value:
+            x -= BLOCK_SIZE
+        elif nd == Direction.DOWN.value:
+            y += BLOCK_SIZE
+        else:
+            y -= BLOCK_SIZE
+        return (x, y)
+
+    def _observe_flood(self, n):
+        """Basic 11, then the flood fill numbers scaled to 0..9."""
+        out = np.zeros((n, 25), dtype=np.int8)
+        out[:, :11] = self._observe_basic(n)
+        for i in range(n):
+            st = self.trap_stats(i)
+            cells = st["cells"]
+            # Reachable area as a fraction of the board, in tenths.
+            out[i, 11] = min(9, int(st["trap_ratio"] * 10))
+            out[i, 12] = min(9, int(st["best_move_area"] / cells * 10))
+            out[i, 13] = st["legal_moves"]
+            out[i, 14] = 1 if st["tail_reachable"] else 0
+            for j, m in enumerate(("straight", "right", "left")):
+                if m in st["per_move_area"]:
+                    out[i, 15 + j] = min(9, int(st["per_move_area"][m] / cells * 10))
+                else:
+                    out[i, 15 + j] = -1
+            out[i, 18] = min(9, int(st["free_ratio"] * 10))
+            out[i, 19] = min(9, int(st["body"] / cells * 10))
+            out[i, 20] = 9 - out[i, 11]
+            out[i, 21] = 1 if st["best_move_area"] < st["body"] else 0
+            out[i, 22] = min(9, int(st["reachable_from_head"] / max(1, st["free"]) * 9))
+            out[i, 23] = 9 - min(9, int(st["free_ratio"] * 10))
+            out[i, 24] = 1 if st["legal_moves"] <= 1 else 0
+        return out
 
     def _observe_basic(self, n):
         out = np.zeros((n, 11), dtype=np.int8)
